@@ -16,7 +16,7 @@ from ultralytics import YOLO
 class Process:
     def __init__(self,device, matrix):
         self.segment_model = YOLO("./runs/segment/segment_aug/weights/best.pt").to(device)
-        self.vehicle_model_nt = YOLO('./runs/detect/vehicle_aug/weights/best.pt').to(device)
+        self.vehicle_model_nt = YOLO('./runs/detect/vehicle_aug_ft/weights/best.pt').to(device)
         self.lane_queue = queue.Queue(maxsize=1)  # 只保留最新任务
         self.vehicle_queue = queue.Queue(maxsize=1)  # 只保留最新任务
 
@@ -75,7 +75,7 @@ class Process:
 
     def vehicle_worker(self):
         """车辆检测线程工作函数"""
-        vehicle_model = YOLO('./runs/detect/vehicle_aug/weights/best.pt').to(self.device)
+        vehicle_model = YOLO('./runs/detect/vehicle_aug_ft/weights/best.pt').to(self.device)
 
         while not self.stop_event.is_set():
             try:
@@ -136,6 +136,7 @@ class Process:
 
         ########################################### draw_masks
         frame = cv2.addWeighted(segmented_frame, 0.3, frame, 0.7, 0)
+
         ########################################### detect_accident
         if detect_accident:
             acc_results = self.accident_model(segmented_frame, save=False, verbose=False, half=True, device=self.device)
@@ -153,7 +154,7 @@ class Process:
             lane_results = self.lane_result_queue.get()
             vehicle_results = self.vehicle_result_queue.get()
 
-            frame = lane_results[0].plot(img=frame, labels=False)
+            # frame = lane_results[0].plot(img=frame, labels=False)
             if vehicle_results[0].boxes.data.size(0) !=0:
                 bike, person = self.bike_preson_processing(frame, vehicle_results[0].boxes)
                 vehicle_results_boxes = self.group_boxes(masks_tensor, vehicle_results[0].boxes.data)
@@ -161,6 +162,8 @@ class Process:
                 frame, mask_speed_info, stop_car, slow_car= self.speed_post_processing(frame, lane_results[0].boxes.data, vehicle_results_boxes)
                 frame, info, crowd = self.evaluate(frame, mask_density_info, mask_speed_info, vehicle_results_boxes)
                 # print(info)
+
+
         else:
             vehicle_results = self.vehicle_model_nt.predict(segmented_frame, save=False, verbose=False, half=True, device=self.device)  # 目标追踪
             if vehicle_results[0].boxes.data.size(0) != 0:
@@ -329,8 +332,8 @@ class Process:
             center_x = (x1 + x2) / 2
             center_y = (y1 + y2) / 2
 
-            box_w = abs(x2 - x1)
-            box_h = abs(y2 - y1)
+            # box_w = abs(x2 - x1)
+            # box_h = abs(y2 - y1)
 
 
             # 获取变换后的点
@@ -366,8 +369,8 @@ class Process:
                 int(center_y),
                 int(center_x_t),
                 int(center_y_t),
-                int(box_w),
-                int(box_h)
+                int(box_w_t),
+                int(box_h_t)
             ]
         if get_scaling_factor:
             scaling_factor = sum(scaling_factor_lst) / (len(scaling_factor_lst) + 1e-10)
@@ -393,13 +396,13 @@ class Process:
                     if track_id in self.past_dis:
                         # print("okk")
                         past_dis = self.past_dis[track_id]
-                        dis = np.clip(dis, past_dis - 3, past_dis + 3)
+                        dis = np.clip(dis, past_dis - 5, past_dis + 5)
                     self.past_dis[track_id] = dis
                     # print(self.past_dis)
                     v = abs(dis * self.scaling_factor - drone_speed)
                     v = int((-0.006 * v + 1.39) * v)
 
-                    if v < 5:
+                    if v <= 0:
                         v = 0
                         stopped_car.append([int(current_pos[0] - current_pos[4] / 2), int(current_pos[1] - current_pos[5] / 2),
                                             int(current_pos[0] + current_pos[4] / 2), int(current_pos[1] + current_pos[5] / 2)])
@@ -414,7 +417,7 @@ class Process:
                         cv2.putText(frame, label, (int(current_pos[0] - t_size[0] / 2), current_pos[1]),
                                     0, 0.35, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
 
-                    elif 5 <= v <20:
+                    elif 0 < v <20:
                         slow_car.append([int(current_pos[0] - current_pos[4] / 2), int(current_pos[1] - current_pos[5] / 2),
                                             int(current_pos[0] + current_pos[4] / 2), int(current_pos[1] + current_pos[5] / 2)])
                         cv2.rectangle(frame, (
@@ -473,7 +476,7 @@ class Process:
 
         x_offset = 50
         y_offset = 50
-        label = f'Drone speed: {int(0.2 * v_average + 0.8 * self.past_drone_speed)},scaling_factor:{self.scaling_factor}'
+        label = f'Drone speed: {int(0.2 * v_average + 0.8 * self.past_drone_speed)}'
         t_size = cv2.getTextSize(label, 0, fontScale=0.45, thickness=1)[0]
         cv2.rectangle(frame, (x_offset, y_offset - t_size[1] - 3), (x_offset + t_size[0], y_offset + 3), (0, 255, 0), -1)
         cv2.putText(frame, label, (x_offset, y_offset), 0, 0.45, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
