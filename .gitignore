@@ -1,0 +1,21 @@
+# 大型压缩包/数据（避免误传）
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 模型权重
+*.pt
+*.onnx
+*.engine
+*.pth
+
+# JetBrains
+.idea/

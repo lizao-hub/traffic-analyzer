@@ -1,3 +1,37 @@
+"""
+process.py — 交通视频帧间流水线引擎
+====================================================
+
+一帧的数据流（S → L∥V → P）
+    一帧图
+      → [S 分割   cuda:0] 产出 masked_frame / overlay_frame / road_masks(GPU) / masks_np(CPU)
+      → 并行分发给两个 worker：
+          ├→ [L 车道   cuda:2] 车道线 track → lane_boxes(numpy)
+          └→ [V 车辆   cuda:1] 车辆 track + 按掩码分组 → (boxes, grouped)(numpy)
+      → [P 后处理  CPU]  空检守卫 + 密度/速度/拥堵/异常事件（含跨帧状态）
+      → ProcessFrameResult
+
+帧间重叠（本文件的核心价值）
+    阶段间用“单消费者 FIFO”队列串起来：Seg线程 → Lane/Veh worker → P线程。
+    每个阶段同时只处理一帧，天然保序（ByteTrack/速度跨帧状态安全）且单飞（模型线程安全）；
+    相邻帧可同时处于不同阶段 → S(N+1)、L/V(N)、P(N-1) 在 3 张 GPU + CPU 上重叠执行。
+
+对外 API（server.py 只用这 4 个 + 2 个生命周期方法）
+    start_pipeline()     开始一个流水线会话（线程都在 __init__ 常驻，这里只复位会话状态）
+    submit_frame(frame)  提交一帧 → 返回 seq（有界队列满时阻塞 = 背压，不丢帧）
+    get_result(timeout)  按帧号顺序取回 (seq, ProcessFrameResult)
+    close_pipeline()     收尾（请先 get_result 取完全部结果再调用）
+    reset_video_state()  一段视频/一次会话开始前调用（清跨帧状态）
+    shutdown()           进程退出时关闭所有线程
+
+# 节点地图（对照教学骨架 process_pseudocode.py）
+#     伪代码节点            本文件实现位置                            说明
+#     _node_segment        _segment_road()                            S：分割
+#     _node_lane           _lane_worker() 线程内模型调用               L：车道线 → numpy
+#     _node_vehicle        _vehicle_worker() 线程内调用 + _group_by_mask  V：车辆+分组 → numpy
+#     _node_post_process   _run_post_stage()                          P：纯 CPU 后处理
+#     process_pipeline     由 submit_frame()+get_result() 组合         伪代码=单帧阻塞，本文件=多帧流水线
+"""
 import time
 import numpy as np
 import os
@@ -18,7 +52,6 @@ class DetectionConfig:
     # 功能开关（客户端可选）
     enable_bike_person: bool = True    # 自行车/行人检测
     enable_stop_slow: bool = True      # 停止/慢速车辆检测
-    enable_accident: bool = True       # 事故检测
 
 
 class AbnormalEventType(Enum):
@@ -27,7 +60,6 @@ class AbnormalEventType(Enum):
     PERSON = "person"                  # 行人检测
     STOPPED_VEHICLE = "stopped_vehicle"  # 停止的车辆
     SLOW_VEHICLE = "slow_vehicle"      # 慢速车辆
-    ACCIDENT = "accident"              # 事故检测
 
 
 @dataclass
@@ -42,8 +74,11 @@ class ProcessFrameResult:
     """单帧处理结果封装类 - 优化版"""
     frame: np.ndarray
     traffic_congestion: bool = False                          # 交通拥堵标志（不再返回区域）
+
     abnormal_events: List[AbnormalEvent] = field(default_factory=list)  # 异常事件列表
-    output_filename: Optional[str] = None                     # 有异常事件时保存的唯一输出文件名
+    output_filename: Optional[str] = None  # 有异常事件时保存的唯一输出文件名
+    metrics: Optional[Dict] = None                            # 本帧数值化指标（供前端展示；含密度/速度/拥堵区域/车辆数）
+
     is_abnormal: bool = False                                 # 异常返回标志：True 表示本帧未正常处理完成（代码或模型处理问题）
 
 
@@ -55,12 +90,10 @@ class TrafficAnalyzer:
     SEGMENT_MODEL_PATH = "./runs/hz/viaduct/weights/best.pt"
     VEHICLE_MODEL_PATH = "./runs/hz/vehicle/weights/best.pt"
     LANE_MODEL_PATH = "./runs/hz/line/weights/best.pt"
-    ACCIDENT_MODEL_PATH = "./runs/hz/accident/weights/best.pt"
 
     SEGMENT_DEVICE = "cuda:0"
     VEHICLE_DEVICE = "cuda:1"
     LANE_DEVICE = "cuda:2"
-    ACCIDENT_DEVICE = "cuda:3"
 
     INPUT_WIDTH = 960
     INPUT_HEIGHT = 540
@@ -82,41 +115,47 @@ class TrafficAnalyzer:
         self.input_width = self.INPUT_WIDTH
         self.input_height = self.INPUT_HEIGHT
 
+        # 密度统计 CPU 坐标网格缓存（输入尺寸固定，只建一次）
+        self._density_yf = None
+        self._density_xf = None
+        self._density_H = 0
+        self._density_W = 0
+
         # 初始化设备
         self.segment_device = torch.device(self.SEGMENT_DEVICE)
         self.vehicle_device = torch.device(self.VEHICLE_DEVICE)
         self.lane_device = torch.device(self.LANE_DEVICE)
-        # self.accident_device = torch.device(self.ACCIDENT_DEVICE)
 
         # 加载模型（统一在 __init__ 一次性加载，worker 只取用，避免重复加载浪费显存）
         self.segment_model = YOLO(self.SEGMENT_MODEL_PATH).to(self.segment_device)
         self.vehicle_model = YOLO(self.VEHICLE_MODEL_PATH).to(self.vehicle_device)
         self.lane_model = YOLO(self.LANE_MODEL_PATH).to(self.lane_device)
-        # self.accident_model = YOLO(self.ACCIDENT_MODEL_PATH).to(self.accident_device)
 
-        # 线程通信队列（输入队列使用双缓冲避免数据丢失）
-        self.lane_queue = queue.Queue(maxsize=2)
-        self.vehicle_queue = queue.Queue(maxsize=2)
-        # self.accident_queue = queue.Queue(maxsize=2)
+        # ============ 全部队列统一在此创建（与线程同寿命，都由 __init__ 管理） ============
+        self.seg_queue = queue.Queue(maxsize=4)      # S 输入：满则 submit_frame 阻塞（背压，不丢帧）
+        self.lane_queue = queue.Queue(maxsize=2)     # → L worker
+        self.vehicle_queue = queue.Queue(maxsize=2)  # → V worker
+        self.out_queue = queue.Queue(maxsize=16)     # P 输出：按帧号顺序，供 get_result 取
+        self.save_queue = queue.Queue(maxsize=30)    # → 写图线程（满了丢弃异常事件图，不阻塞）
 
-        # 结果存储：按 frame_id 对齐各模型结果（解决多线程结果错帧问题）
+        # 结果存储：按 seq 对齐各模型结果  L worker 和 V worker 是两个独立的线程、各跑各的 GPU，它们处理同一帧的快慢不一样
         self.lane_results = {}
         self.vehicle_results = {}
-        # self.accident_results = {}
-        self.results_lock = threading.Lock()
-        self.results_cond = threading.Condition(self.results_lock)
 
-        # 异步图片保存队列
-        self.save_queue = queue.Queue(maxsize=30)
+        self.results_cond = threading.Condition()   # 锁+门铃：保护共享字典，并让 P 线程 wait / 被 notify 唤醒
+
+        # 会话状态（一次 start_pipeline ~ close_pipeline 为一个会话；线程常驻，会话只是“开关”）
+        self._pipeline_on = False
+        self._pipeline_seq = 0
+        self._pipeline_total = None
+        self.seg_payload = {}                 # seq -> 分割阶段产物（会话开始时清空）
+        self._seg_done = False                # 本会话 Seg 线程是否已消费“结束哨兵”
+        self._session_finished = threading.Event()  # 本会话全部帧处理完成信号
 
         # 控制标志
         self.stop_event = threading.Event()
-        self.pause_event = threading.Event()
 
-        # 帧计数器（整型递增，替代 time.time() 作为帧 ID）
-        self._frame_counter = 0
-
-        # 启动工作线程
+        # 启动所有线程（同寿命：S/P/L/V/写图 全部在 __init__ 启动，之后不再创建线程）
         self._start_workers()
 
         self.scaling_factor = 3.0
@@ -133,41 +172,33 @@ class TrafficAnalyzer:
 
 
 
-
-
     def _start_workers(self):
-        """启动工作线程"""
+        """启动全部线程（同一寿命，只在 __init__ 调用一次，之后不再创建线程）。"""
+        self.segment_thread = threading.Thread(target=self._pipeline_segment_worker, name="Seg", daemon=True)
+        self.post_thread = threading.Thread(target=self._pipeline_post_worker, name="P", daemon=True)
         self.lane_thread = threading.Thread(target=self._lane_worker, name="LaneWorker", daemon=True)
         self.vehicle_thread = threading.Thread(target=self._vehicle_worker, name="VehicleWorker", daemon=True)
-        # self.accident_thread = threading.Thread(target=self._accident_worker, name="AccidentWorker", daemon=True)
         self.save_thread = threading.Thread(target=self._async_writer_worker, name="SaveWriter", daemon=True)
-        self.lane_thread.start()
-        self.vehicle_thread.start()
-        # self.accident_thread.start()
-        self.save_thread.start()
+        for t in (self.segment_thread, self.post_thread, self.lane_thread,
+                  self.vehicle_thread, self.save_thread):
+            t.start()
 
-    def __enter__(self):
-        """上下文管理器入口"""
-        return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """上下文管理器出口，确保资源释放"""
-        self.shutdown()
-        return False
-
+    # ============================================================
+    # L 节点 worker 线程（车道, GPU cuda:2）—— 对应伪代码 _node_lane
+    # 消费 Seg 分发来的任务 (seq, masked_frame)，车道线 track 后把结果转成 numpy
+    # 存入 lane_results[seq]，并 notify P 线程；任务帧号即流水线 seq。
+    # ============================================================
     def _lane_worker(self):
         """车道线检测工作线程"""
         while not self.stop_event.is_set():
-            if self.pause_event.is_set():
-                time.sleep(0.1)
-                continue
-
             try:
                 # 非阻塞获取任务
                 task = self.lane_queue.get(timeout=0.5)
                 if task is None:
                     continue
 
+                # 任务来自 Seg 线程： (seq, masked_frame)
                 frame_id, masked_frame = task
 
                 # 执行车道线检测
@@ -181,31 +212,40 @@ class TrafficAnalyzer:
                     conf=0.5
                 )
 
+                # CPU 化边界：只把下游所需的 boxes.data 转成 numpy 存入结果字典（不再传递 Results 对象）
+                lane_boxes = None
+                if results:
+                    boxes = getattr(results[0], "boxes", None)
+                    lane_boxes = boxes.data.cpu().numpy() if (boxes is not None and boxes.data.numel() > 0) else None
+
                 # 按 frame_id 存入结果字典并通知等待方
                 with self.results_cond:
-                    self.lane_results[frame_id] = results
-                    self._prune_results(self.lane_results, frame_id)
-                    self.results_cond.notify_all()
+                    self.lane_results[frame_id] = lane_boxes # 1. 把这一帧的结果放进盒子
+                    self._prune_results(self.lane_results, frame_id) # 2. 顺手清理过期结果
+                    self.results_cond.notify_all() # 3. 敲门：告诉 P 线程"有新货了"
 
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Lane worker error: {e}")
 
+    # ============================================================
+    # V 节点 worker 线程（车辆, GPU cuda:1）—— 对应伪代码 _node_vehicle
+    # 消费 Seg 分发来的任务 (seq, masked_frame, road_masks)：
+    # 车辆 track + _group_by_mask(按道路掩码分组，GPU 内完成) → numpy 数据包
+    # (boxes, grouped) 存入 vehicle_results[seq]，并 notify P 线程。
+    # ============================================================
     def _vehicle_worker(self):
         """车辆检测工作线程"""
         while not self.stop_event.is_set():
-            if self.pause_event.is_set():
-                time.sleep(0.1)
-                continue
-
             try:
                 # 非阻塞获取任务
                 task = self.vehicle_queue.get(timeout=0.5)
                 if task is None:
                     continue
 
-                frame_id, masked_frame = task
+                # 任务来自 Seg 线程： (seq, masked_frame, road_masks)
+                frame_id, masked_frame, road_masks = task
 
                 # 执行车辆检测和跟踪
                 results = self.vehicle_model.track(
@@ -218,9 +258,16 @@ class TrafficAnalyzer:
                     device=self.vehicle_device
                 )
 
-                # 按 frame_id 存入结果字典并通知等待方
+                # 分组（_group_by_mask）在 worker 内于 GPU 完成，下游（P 线程）不再触碰 GPU 张量
+                boxes_np, grouped_np = None, None
+                if results:
+                    boxes = getattr(results[0], "boxes", None)
+                    boxes_np = boxes.data.cpu().numpy() if (boxes is not None and boxes.data.numel() > 0) else None
+                    grouped_np = self._group_by_mask(road_masks, results).cpu().numpy()
+
+                # CPU 化边界：存入 (原始框数组, 分组后数组) 数据包，不再传递 Results 对象
                 with self.results_cond:
-                    self.vehicle_results[frame_id] = results
+                    self.vehicle_results[frame_id] = (boxes_np, grouped_np)
                     self._prune_results(self.vehicle_results, frame_id)
                     self.results_cond.notify_all()
 
@@ -228,41 +275,6 @@ class TrafficAnalyzer:
                 continue
             except Exception as e:
                 print(f"Vehicle worker error: {e}")
-
-    # def _accident_worker(self):
-    #     """事故检测工作线程"""
-    #     while not self.stop_event.is_set():
-    #         if self.pause_event.is_set():
-    #             time.sleep(0.1)
-    #             continue
-    #
-    #         try:
-    #             # 非阻塞获取任务
-    #             task = self.accident_queue.get(timeout=0.5)
-    #             if task is None:
-    #                 continue
-    #
-    #             frame_id, masked_frame = task
-    #
-    #             # 执行事故检测
-    #             results = self.accident_model.predict(
-    #                 masked_frame,
-    #                 imgsz=960,
-    #                 verbose=False,
-    #                 half=True,
-    #                 device=self.accident_device
-    #             )
-    #
-    #             # 按 frame_id 存入结果字典并通知等待方
-    #             with self.results_cond:
-    #                 self.accident_results[frame_id] = results
-    #                 self._prune_results(self.accident_results, frame_id)
-    #                 self.results_cond.notify_all()
-    #
-    #         except queue.Empty:
-    #             continue
-    #         except Exception as e:
-    #             print(f"Accident worker error: {e}")
 
     def _async_writer_worker(self):
         """异步图片写入工作线程"""
@@ -282,101 +294,73 @@ class TrafficAnalyzer:
                 # 无论成败都标记完成，保证 shutdown() 的 join() 能正常返回
                 self.save_queue.task_done()
 
-    def process_frame(self, frame: np.ndarray) -> ProcessFrameResult:
-        # 输入为空：属异常返回（代码/输入问题）
-        if frame is None or frame.size == 0:
-            result = ProcessFrameResult(frame=frame, is_abnormal=True)
-            return result
+    # ============================================================
+    # P 节点入口（后处理, 纯 CPU）—— 对应伪代码 _node_post_process
+    # 由流水线 P 线程按帧号顺序调用：空检守卫 → 自行车/行人 → 密度 → 速度 → 拥堵
+    # → 异常事件 → ProcessFrameResult。所有跨帧状态都只在这里被串行更新。
+    # ============================================================
+    def _run_post_stage(self, raw_frame: np.ndarray, lane_boxes, veh_pkt,
+                        overlay_frame: np.ndarray, masks_np: np.ndarray) -> ProcessFrameResult:
+        """统一空检出守卫 + P 阶段（纯 CPU，含跨帧状态）。
 
-        # 从配置读取功能开关
+        由流水线 P 线程调用；raw_frame 为已 resize 的原始帧（异常返回时作为画面）；
+        lane_boxes / veh_pkt 为 worker 产出的 numpy 数据包。
+        """
         enable_bike_person = self.config.enable_bike_person
         enable_stop_slow = self.config.enable_stop_slow
-        # enable_accident = self.config.enable_accident  # 事故检测暂时关闭，后续再改
 
-        # 输入尺寸与类定义尺寸不一致时，先 resize 到统一尺寸
-        if frame.shape[0] != self.input_height or frame.shape[1] != self.input_width:
-            frame = cv2.resize(frame, (self.input_width, self.input_height))
-
-        result = ProcessFrameResult(frame=frame.copy())
-
-
-        # 道路分割：返回全遮蔽帧（目标检测用）、半透明叠加帧（可视化用）与道路掩码
-        masked_frame, overlay_frame, road_masks = self._segment_road(frame)
-        if road_masks is None:
-            # 未检测到道路，属异常返回（模型处理问题）
+        # 统一空检出准则：分割模型用 r.masks is None 判空（见 _segment_road）；
+        # 检测/追踪模型判空 = 结果数组行数为 0。
+        # 任一模型未检出对象都视为本帧未正常处理完成（abnormal 返回，不进入下游后处理）：
+        #   - 车道线模型没追踪到车道框 → 速度计算无车道依据；
+        #   - 车辆模型没追踪到车辆框 → 与分割/车道结果矛盾，同样按异常帧处理。
+        if lane_boxes is None or lane_boxes.shape[0] == 0:
+            result = ProcessFrameResult(frame=raw_frame.copy())
             result.is_abnormal = True
             return result
 
-        # 整型帧 ID（替代 time.time()，用于多模型结果对齐）
-        frame_id = self._next_frame_id()
-
-        # 并行提交车道/车辆两个任务到各自 worker（各自 GPU 上并行推理）
-        # masked_frame 为只读输入，两个队列复用同一引用，避免重复拷贝
-        self._submit_task(self.lane_queue, frame_id, masked_frame)
-        self._submit_task(self.vehicle_queue, frame_id, masked_frame)
-        # if enable_accident:
-        #     self._submit_task(self.accident_queue, frame_id, masked_frame)
-
-        # 按 frame_id 对齐取回各模型结果
-        lane_results = self._wait_result(self.lane_results, frame_id)
-        vehicle_results = self._wait_result(self.vehicle_results, frame_id)
-        # accident_results = self._wait_result(self.accident_results, frame_id) if enable_accident else None
-
-        # worker 超时或异常时 _wait_result 返回 None，直接异常返回。
-        if not lane_results or not vehicle_results:
+        if veh_pkt is None:
+            result = ProcessFrameResult(frame=raw_frame.copy())
             result.is_abnormal = True
             return result
 
-        # 车道未检出任何 box 时直接返回：速度计算依赖车道框，缺车道则无速度依据。
-        # 车辆未检出 box 则放行继续（空道路属正常结果，下游各函数均对空数据有守卫）。
-        lane_boxes = getattr(lane_results[0], "boxes", None)
-        if lane_boxes is None or lane_boxes.data.numel() == 0:
+        veh_boxes_np, vehicle_boxes = veh_pkt
+        if veh_boxes_np is None or veh_boxes_np.shape[0] == 0:
+            result = ProcessFrameResult(frame=raw_frame.copy())
             result.is_abnormal = True
             return result
 
         # 各类检测结果（先收集为局部变量，再统一映射为异常事件）
         bike_detections, person_detections = [], []
         stopped_vehicles, slow_vehicles = [], []
-        # accident_detections = []
         density_info, speed_info = {}, {}
 
+        # 自此以下全部为 CPU 数据处理：分组已在 vehicle worker 内完成，密度统计吃 CPU 掩码
         if enable_bike_person:
-            bike_detections, person_detections = self._process_bike_person(overlay_frame, vehicle_results)
+            bike_detections, person_detections = self._process_bike_person(overlay_frame, veh_boxes_np)
 
-        # # 事故检测（开关控制）
-        # if enable_accident and accident_results is not None:
-        #     accident_detections = self._process_accident(overlay_frame, accident_results[0].boxes)
-
-        # 车辆检测（速度/密度/拥堵为基本内容，始终执行）
-        # if vehicle_results is not None and vehicle_results[0].boxes.data.size(0) != 0:
-            # 自行车/行人检测（开关控制）
-            # if enable_bike_person:
-            #     bike_detections, person_detections = self._process_bike_person(overlay_frame, vehicle_results[0].boxes)
-
-        vehicle_boxes = self._group_by_mask(road_masks, vehicle_results)
-
-        overlay_frame, density_info = self._process_traffic_density(overlay_frame, road_masks, vehicle_boxes)
-
+        overlay_frame, density_info = self._process_traffic_density(overlay_frame, masks_np, vehicle_boxes)
 
         # 速度计算（基本内容，始终执行；停止/慢速车辆由开关控制）
-        if enable_stop_slow:
-            overlay_frame, speed_info, stopped_vehicles, slow_vehicles = self._process_speed(
-                overlay_frame, lane_results, vehicle_boxes, enable_stop_slow=enable_stop_slow
-            )
-        else:
-            overlay_frame, speed_info, stopped_vehicles, slow_vehicles = self._process_speed(
-                overlay_frame, lane_results, vehicle_boxes, enable_stop_slow=enable_stop_slow
-            )
-
-        # 密度分析（基本内容，始终执行）
-
+        overlay_frame, speed_info, stopped_vehicles, slow_vehicles = self._process_speed(
+            overlay_frame, lane_boxes, vehicle_boxes, enable_stop_slow=enable_stop_slow
+        )
 
         # 拥堵评估（基本内容，始终执行，只保留标志位）
         overlay_frame, _, congestion_regions = self._evaluate_congestion(
             overlay_frame, density_info, speed_info, vehicle_boxes
         )
-        result.traffic_congestion = bool(congestion_regions)
 
+        result = ProcessFrameResult(frame=overlay_frame)
+        result.traffic_congestion = bool(congestion_regions)
+        # 本帧数值化指标（供 FastAPI 前端展示/统计；纯 CPU 只读汇总，不参与绘图，不影响原结果）
+        result.metrics = {
+            "total_vehicles": int(vehicle_boxes.shape[0]),
+            "mask_density": {str(k): round(float(v), 4) for k, v in density_info.items()},
+            "mask_speed": {str(k): round(float(v), 2) for k, v in speed_info.items()},
+            "congestion_regions": [[int(x1), int(y1), int(x2), int(y2)]
+                                    for x1, y1, x2, y2 in congestion_regions],
+        }
         # 汇总异常事件：自行车/行人/停止车辆/慢速车辆（事故检测暂时关闭）
         result.abnormal_events = self._collect_abnormal_events(
             bike_detections, person_detections, stopped_vehicles, slow_vehicles
@@ -384,11 +368,184 @@ class TrafficAnalyzer:
         # 有异常事件则保存一帧图像（一帧可有多个异常事件，但只保存一张，命名不含事件名称）
         if result.abnormal_events:
             result.output_filename = self._save_abnormal_event(overlay_frame)
-
-        result.frame = overlay_frame
-
         return result
 
+    # ==================== 帧间流水线（异步编排 + 阶段线程执行，多帧重叠） ====================
+    # 拓扑：  提交(S队列) → [Seg线程:cuda0] → {Lane队列:cuda2, Vehicle队列:cuda1} → [P线程:CPU]
+    # 每个阶段都是“单消费者 FIFO”：天然保序（追踪器跨帧状态安全）且单飞（模型线程安全）；
+    # 相邻帧可同时处于不同阶段 → 不同 GPU/CPU 资源重叠使用。
+    # 本文件为“纯流水线版”：对外入口就是下面的 start_pipeline/submit_frame/get_result/close_pipeline。
+
+    def start_pipeline(self):
+        """开始一个新的流水线会话（线程已在 __init__ 常驻，这里只复位会话状态）。"""
+        if self._pipeline_on:
+            return
+        # 复位会话状态（上一会话已通过 close_pipeline 结束，这里做防御性清理）
+        with self.results_cond:
+            self.lane_results.clear()
+            self.vehicle_results.clear()
+            self.seg_payload.clear()
+        self._pipeline_seq = 0
+        self._pipeline_total = None
+        self._seg_done = False
+        self._session_finished.clear()
+        # 防御性排空上一会话可能残留的任务/结果（正常 close 后应为空；异常中止时防串会话）
+        for _q in (self.seg_queue, self.out_queue, self.lane_queue, self.vehicle_queue):
+            while True:
+                try:
+                    _q.get_nowait()
+                except queue.Empty:
+                    break
+        self._pipeline_on = True
+
+    def submit_frame(self, frame: np.ndarray) -> int:
+        """提交一帧进入流水线（S 阶段队列），返回帧号。队列满时阻塞等待（背压）。"""
+        if not self._pipeline_on:
+            self.start_pipeline()
+        seq = self._pipeline_seq
+        self._pipeline_seq += 1
+        self.seg_queue.put((seq, frame), timeout=60.0)
+        return seq
+
+    def get_result(self, timeout: float = 5.0):
+        """按帧号顺序取回一个结果，返回 (seq, ProcessFrameResult)；超时返回 (None, None)。"""
+        try:
+            return self.out_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None, None
+
+    def close_pipeline(self):
+        """结束本会话：给 Seg 线程发“结束哨兵”，等 P 线程处理完所有已提交帧后复位会话开关。
+        线程并不退出（常驻，供下一会话复用）。调用前请先 get_result 取回全部结果。"""
+        if not self._pipeline_on:
+            return
+        self._pipeline_total = self._pipeline_seq
+        self.seg_queue.put(None)                     # 哨兵排在所有帧之后
+        if not self._session_finished.wait(timeout=30.0):
+            print("close_pipeline 等待本会话结束超时")
+        self._pipeline_on = False
+
+    def _pipeline_segment_worker(self):
+        """S 阶段（常驻线程）：分割(GPU cuda:0) → 分发 L/V 队列。
+        无会话时休眠；收到 None 哨兵表示本会话不再有新帧（并不退出线程）。"""
+        while not self.stop_event.is_set():
+            if not self._pipeline_on:
+                time.sleep(0.05)
+                continue
+            try:
+                task = self.seg_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if task is None:
+                # 本会话帧已全部提交：置结束标志并叫醒 P 线程做收尾判断
+                with self.results_cond:
+                    self._seg_done = True
+                    self.results_cond.notify_all()
+                continue
+            seq, frame = task
+            try:
+                if frame.shape[0] != self.input_height or frame.shape[1] != self.input_width:
+                    frame = cv2.resize(frame, (self.input_width, self.input_height))
+                masked_frame, overlay_frame, road_masks, masks_np = self._segment_road(frame)
+            except Exception as e:
+                print(f"PipeSeg error: {e}")
+                with self.results_cond:
+                    self.seg_payload[seq] = (".fail", frame)
+                    self.results_cond.notify_all()
+                continue
+
+            if masks_np is None:
+                # 分割模型未检出道路 → 无需 L/V，直接标记该帧按异常产出
+                with self.results_cond:
+                    self.seg_payload[seq] = (".fail", frame)
+                    self.results_cond.notify_all()
+                continue
+
+            # 阻塞入队（超时保护），保证不丢帧、不破坏帧号顺序
+            self.lane_queue.put((seq, masked_frame), timeout=60.0)
+            self.vehicle_queue.put((seq, masked_frame, road_masks), timeout=60.0)
+            with self.results_cond:
+                self.seg_payload[seq] = (frame, overlay_frame, masks_np)
+                self.results_cond.notify_all()
+
+    def _pipeline_post_worker(self):
+        """P 阶段（常驻线程）：按帧号顺序等待 (S/L/V) 就绪 → 执行 _run_post_stage（纯 CPU）→ 输出队列。
+        单消费者保证跨帧状态（速度/缩放因子/历史目标）只被串行按序更新。
+        无会话时休眠；本会话全部处理完则发完成信号并复位，等待下一会话。
+        兜底：某帧长时间凑不齐 L/V 结果（worker 异常）时按异常帧产出，保证不挂起。"""
+        seq = 0
+        stall_since = None
+        while not self.stop_event.is_set():
+            if not self._pipeline_on:
+                time.sleep(0.05)
+                continue
+
+            ready = None            # None=未就绪；("ok",...)/("fail",...) = 已取走该帧全部产物
+            with self.results_cond:
+                seg_ready = seq in self.seg_payload
+                payload = self.seg_payload.get(seq)
+                is_fail = isinstance(payload, tuple) and len(payload) == 2 and payload[0] == ".fail"
+
+                if not seg_ready:
+                    if (self._pipeline_total is not None and seq >= self._pipeline_total
+                            and self._seg_done):
+                        # 本会话全部帧已处理完：通知 close_pipeline，复位帧号，等开关关闭后进入空闲
+                        self._session_finished.set()
+                        seq = 0
+                        stall_since = None
+                        while self._pipeline_on and not self.stop_event.is_set():
+                            self.results_cond.wait(timeout=0.1)
+                        continue
+                elif is_fail:
+                    self.seg_payload.pop(seq)
+                    ready = ("fail", payload[1])
+                else:
+                    lane_ok = seq in self.lane_results
+                    veh_ok = seq in self.vehicle_results
+                    if lane_ok and veh_ok:
+                        lane_boxes = self.lane_results.pop(seq)
+                        veh_pkt = self.vehicle_results.pop(seq)
+                        self.seg_payload.pop(seq)
+                        ready = ("ok", payload, lane_boxes, veh_pkt)
+
+                if ready is None:
+                    if stall_since is None:
+                        stall_since = time.time()
+                    stalled = time.time() - stall_since > 30.0
+                    seg_finished = (self._pipeline_total is not None and self._seg_done)
+                    if stalled and seg_finished:
+                        # 兜底：分割已结束却仍凑不齐该帧 L/V 结果 → 按异常产出并推进
+                        self.seg_payload.pop(seq, None)
+                        self.lane_results.pop(seq, None)
+                        self.vehicle_results.pop(seq, None)
+                        ready = ("fail", None)
+                        print(f"PipePost 兜底跳过 seq={seq}（缺少 L/V 结果）")
+                    else:
+                        self.results_cond.wait(timeout=0.5)
+                        continue
+                else:
+                    stall_since = None
+
+            # 持锁外执行（可能耗时）
+            if ready[0] == "fail":
+                raw = ready[1]
+                if raw is None:
+                    res = ProcessFrameResult(frame=np.zeros(
+                        (self.input_height, self.input_width, 3), dtype=np.uint8), is_abnormal=True)
+                else:
+                    res = ProcessFrameResult(frame=raw.copy(), is_abnormal=True)
+            else:
+                _, payload, lane_boxes, veh_pkt = ready
+                raw, overlay_frame, masks_np = payload
+                try:
+                    res = self._run_post_stage(raw, lane_boxes, veh_pkt, overlay_frame, masks_np)
+                except Exception as e:
+                    # 单帧后处理异常 → 按异常帧产出，保证流水线不断
+                    print(f"PipePost error seq={seq}: {e}")
+                    res = ProcessFrameResult(frame=np.zeros(
+                        (self.input_height, self.input_width, 3), dtype=np.uint8), is_abnormal=True)
+            self.out_queue.put((seq, res), timeout=60.0)
+            seq += 1
 
     def _collect_abnormal_events(self, bike_detections, person_detections, stopped_vehicles,
                                  slow_vehicles) -> List[AbnormalEvent]:
@@ -402,9 +559,6 @@ class TrafficAnalyzer:
             events.append(AbnormalEvent(event_type=AbnormalEventType.STOPPED_VEHICLE, detections=stopped_vehicles))
         if slow_vehicles:
             events.append(AbnormalEvent(event_type=AbnormalEventType.SLOW_VEHICLE, detections=slow_vehicles))
-        # 事故检测暂时关闭，后续再改
-        # if accident_detections:
-        #     events.append(AbnormalEvent(event_type=AbnormalEventType.ACCIDENT, detections=accident_detections))
         return events
 
     def _save_abnormal_event(self, frame: np.ndarray) -> str:
@@ -417,34 +571,6 @@ class TrafficAnalyzer:
         except queue.Full:
             pass  # 队列满了丢弃，保证主流程不阻塞
         return filename
-
-    def _submit_task(self, task_queue: queue.Queue, frame_id: int, data: np.ndarray):
-        """提交任务到队列（非阻塞）"""
-        try:
-            task_queue.put((frame_id, data), timeout=0.1)
-        except queue.Full:
-            # 丢弃最旧的任务
-            try:
-                task_queue.get_nowait()
-            except queue.Empty:
-                pass
-            task_queue.put((frame_id, data), timeout=0.1)
-
-    def _next_frame_id(self) -> int:
-        """返回递增的整型帧 ID"""
-        self._frame_counter += 1
-        return self._frame_counter
-
-    def _wait_result(self, result_dict, frame_id: int, timeout: float = 1.0):
-        """按 frame_id 从结果字典取回指定帧的结果，超时返回 None"""
-        with self.results_cond:
-            deadline = time.time() + timeout
-            while frame_id not in result_dict:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    return None
-                self.results_cond.wait(remaining)
-            return result_dict.pop(frame_id)
 
     def _prune_results(self, result_dict, current_frame_id: int, keep: int = 32):
         """清理过期帧的结果，避免长时间运行导致内存泄漏"""
@@ -472,7 +598,12 @@ class TrafficAnalyzer:
 
             return masks_tensor
 
-    def _segment_road(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Optional[torch.Tensor]]:
+    # ============================================================
+    # S 节点（分割, GPU cuda:0）—— 对应伪代码 _node_segment
+    # 输入一帧 → 输出 masked_frame / overlay_frame / road_masks(GPU,给V) / masks_np(CPU,给P)；
+    # 分割为空时返回 (frame, frame, None, None)，由上层按异常帧处理。
+    # ============================================================
+    def _segment_road(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Optional[torch.Tensor], Optional[np.ndarray]]:
         """
         道路分割并生成两类输出图像。
 
@@ -480,14 +611,15 @@ class TrafficAnalyzer:
             frame: 输入帧（BGR，H×W×3，numpy 数组）
 
         Returns:
-            (road_masked_frame, overlay_frame, road_masks):
+            (road_masked_frame, overlay_frame, road_masks, road_masks_np):
                 road_masked_frame : 全遮蔽图像（道路外区域填充固定色），供目标检测模型使用
                 overlay_frame     : 半透明叠加图像（全遮蔽帧与原始帧加权融合），供可视化使用
-                road_masks        : 道路掩码张量（车辆分组 / 密度统计需要），未检测到道路时为 None
+                road_masks        : 道路掩码张量（GPU，供 V worker 分组），未检测到道路时为 None
+                road_masks_np     : road_masks 的 CPU 副本（纯 numpy，供密度统计，P 阶段不碰 GPU）
 
         说明：
             - 掩码提取、全遮蔽帧生成、半透明融合均在 segment_device 上完成，
-              避免中间结果在 GPU/CPU 间来回搬运。
+              避免中间结果在 GPU/CPU 间来回搬运；仅在收尾处一次性产出 CPU 掩码副本。
             - 未检测到道路时回退为原帧，保证调用链不中断（road_masks 为 None 表示失败）。
         """
         if frame is None or frame.size == 0:
@@ -504,13 +636,13 @@ class TrafficAnalyzer:
             frame, imgsz=960, verbose=False, half=True, device=self.segment_device
         )
 
-        # 健壮性：未检出道路掩码时回退为原帧
-        if not seg_results or getattr(seg_results[0], "masks", None) is None:
-            return frame, frame, None
+        # 分割模型空检出判定准则：r.masks is None 表示本帧没有分割出道路对象
+        if not seg_results or seg_results[0].masks is None:
+            return frame, frame, None, None
 
         road_masks = self._extract_roi(seg_results[0].masks.data)
         if road_masks is None:
-            return frame, frame, None
+            return frame, frame, None, None
 
         # GPU 上同时生成全遮蔽帧与半透明叠加帧，一次前向 + 一次矩阵运算，无 CPU 往返
         with torch.no_grad():
@@ -527,228 +659,93 @@ class TrafficAnalyzer:
 
         masked_frame = masked_tensor.permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy()
         overlay_frame = overlay_tensor.permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy()
+        # 收尾处一次性产出 CPU 掩码副本：P 阶段密度统计不再触碰 GPU；GPU 版 road_masks 留给 V worker 分组
+        masks_np = road_masks.cpu().numpy()
 
-        return masked_frame, overlay_frame, road_masks
+        return masked_frame, overlay_frame, road_masks, masks_np
 
-    def clear_queues(self):
-        """清空队列，确保只处理最新帧"""
-        while not self.lane_queue.empty():
-            try:
-                self.lane_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        while not self.vehicle_queue.empty():
-            try:
-                self.vehicle_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        # 事故检测暂时关闭，后续再改
-        # while not self.accident_queue.empty():
-        #     try:
-        #         self.accident_queue.get_nowait()
-        #     except queue.Empty:
-        #         break
-
+    def reset_video_state(self):
+        """重置所有跨帧/跨视频状态，使同一实例可安全开始处理一段新视频。
+        适用于服务端复用同一 TrafficAnalyzer 连续处理多段视频/多次流式会话。
+        注意：不重置 self.count（事件保存文件名保持全局递增，避免重名覆盖）。"""
         with self.results_cond:
             self.lane_results.clear()
             self.vehicle_results.clear()
-            # self.accident_results.clear()
+            if hasattr(self, 'seg_payload'):
+                self.seg_payload.clear()
+        # 跨帧追踪/速度状态（车道线、车辆轨迹、位移与缩放因子）
+        self.past_dis.clear()
+        self.previous_frame_objects = {}
+        self.previous_frame_lines = {}
+        self.past_drone_speed = 10.0
+        self.past_scaling_factor = 3.0
+        self.scaling_factor = 3.0
 
-    def get_scaling_factor(self, data):
-        marge = 25
-        points = []
-        valid_rows = []  # 存储对应的行数据
-
-        # 第一遍遍历：收集所有需要处理的点
-        for row in data:
-            # 提取数据
-            x1, y1, x2, y2 = row[0], row[1], row[2], row[3]
-            if y1 < marge or y2 > self.input_height - marge:
-                continue
-
-            class_id = int(row[-1])
-
-            if class_id != 2:
-                continue
-
-            # 添加左上角和右下角点
-            points.append([x1, y1])  # 左上角
-            points.append([x2, y2])  # 右下角
-
-            # 保存相关信息
-            valid_rows.append(row)
-
-        # 如果没有符合条件的行，直接返回
-        if not points:
-            return self.past_scaling_factor
-
-        # 转换为正确的NumPy数组格式 (N, 1, 2)
-        points_array = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
-
-        # 批量应用透视变换
-        try:
-            transformed_points = cv2.perspectiveTransform(points_array, self.matrix)
-        except Exception as e:
-            print(f"透视变换失败: {e}")
-            # 如果变换失败，使用原始坐标作为后备
-            transformed_points = points_array.copy()
-
-        # 第二遍遍历：处理结果
-        scaling_factor_lst = []
-        for i, row in enumerate(valid_rows):
-            # 获取变换后的点
-            idx = i * 2  # 每个目标对应两个点
-            top_left_t = transformed_points[idx, 0]
-            bottom_right_t = transformed_points[idx + 1, 0]
-
-            if (top_left_t[0] < 0 or top_left_t[0] > self.input_width or
-                    top_left_t[1] < 0 or top_left_t[1] > self.input_height or
-                    bottom_right_t[0] < 0 or bottom_right_t[0] > self.input_width or
-                    bottom_right_t[1] < 0 or bottom_right_t[1] > self.input_height):
-                # 任意一点超出范围，舍弃该目标
-                continue
-
-            # 计算变换后的框尺寸
-            box_w_t = abs(bottom_right_t[0] - top_left_t[0])
-            box_h_t = abs(bottom_right_t[1] - top_left_t[1])
-
-            aspect_ratio = box_h_t / box_w_t if box_w_t > 0 else 0
-            if aspect_ratio < 1.5:
-                continue
-
-            center_x_t = (top_left_t[0] + bottom_right_t[0]) / 2
-            if self.input_width // 4 < center_x_t < 3 * self.input_width // 4:
-                scaling_factor_lst.append(2.25 / box_w_t * 36)
-            else:
-                scaling_factor_lst.append(2.25 / box_w_t * 36)
-
-        if not scaling_factor_lst:
-            return self.past_scaling_factor
-        scaling_factor = sum(scaling_factor_lst) / (len(scaling_factor_lst) + 1e-10)
-        scaling_factor = 0.2 * scaling_factor + 0.8 * self.past_scaling_factor
-        return scaling_factor
-
-    def _process_speed(self, frame: np.ndarray, lane_results: List, vehicle_boxes: torch.Tensor,
+    # ---- P 子步骤 3：按车道/道路块算速度、停止车与慢速车（跨帧状态，P 线程独占保序）----
+    def _process_speed(self, frame: np.ndarray, lane_boxes_np: np.ndarray, vehicle_boxes_np: np.ndarray,
                        enable_stop_slow: bool = True) -> Tuple[np.ndarray, Dict, List, List]:
-        # 车道结果已在调用前确认有 box 数据（process_frame 中的 lane_boxes 守卫），直接取 boxes.data
-        line_results = lane_results[0].boxes.data
-        if line_results.size(0) == 0 or line_results.shape[1] == 6: # no id column
+        # 车道框与车辆分组数组均由 worker CPU 化（numpy），此处全部为 CPU 逻辑
+        if lane_boxes_np.shape[0] == 0 or lane_boxes_np.shape[1] == 6:  # no id column
             drone_speed = self.past_drone_speed
         else:
-            current_frame_lines = self.get_current_frame_objects(line_results.cpu().numpy(), 0,False)
+            current_frame_lines = self.get_current_frame_objects(lane_boxes_np, 0, False)
             drone_speed = self.calculate_drone_speed(frame, current_frame_lines)
             self.past_drone_speed = drone_speed
 
         masks_speed_info = {}
-        current_frame_objects = self.get_current_frame_objects(vehicle_boxes.cpu().numpy())
+        current_frame_objects = self.get_current_frame_objects(vehicle_boxes_np)
         track_id2v, stopped_car, slow_car = self.calculate_cars_speed(frame, current_frame_objects, drone_speed, enable_stop_slow=enable_stop_slow)  # 绘图函数
 
         if len(track_id2v) > 0:
-            # 提取所有track_id和对应的mask_id
-            track_ids = vehicle_boxes[:, 4]
-            mask_ids = vehicle_boxes[:, -1]
+            # 提取所有 track_id 和对应的 mask_id（列位置与今日 GPU 版本完全一致）
+            track_ids = vehicle_boxes_np[:, 4]
+            mask_ids = vehicle_boxes_np[:, -1]
 
-            speed_values = torch.zeros(len(track_ids), device=vehicle_boxes.device)
+            speed_values = np.full(len(track_ids), -1.0, dtype=np.float32)
 
-            for i, track_id in enumerate(track_ids):
+            for i in range(len(track_ids)):
                 # 将 track_id 转换为整数（解决 1.0 vs 1 的问题）
-                track_id_int = int(track_id.item())
+                track_id_int = int(track_ids[i])
 
                 # 如果 track_id 在字典中，获取速度值
                 if track_id_int in track_id2v:
                     speed_values[i] = track_id2v[track_id_int]
                 else:
-                    # 处理缺失的 track_id（使用默认值或跳过）
-                    # 这里使用 -1 表示缺失值，后续计算平均速度时会排除
+                    # 缺失 track_id：使用 -1 表示缺失值，后续计算平均速度时会排除
                     speed_values[i] = -1
 
             # 计算每个 mask_id 的平均速度
-            unique_mask_ids = torch.unique(mask_ids)
-
-            for mask_id in unique_mask_ids:
-                if mask_id.item() == -1:
+            for mask_id in np.unique(mask_ids):
+                mask_id_int = int(mask_id)
+                if mask_id_int == -1:
                     continue
 
-                mask = mask_ids == mask_id
-                mask_speed = speed_values[mask]
+                mask_sel = mask_ids == mask_id
+                mask_speed = speed_values[mask_sel]
 
                 # 排除无效值（-1）
                 valid_speeds = mask_speed[mask_speed >= 0]
 
                 if len(valid_speeds) > 0:
-                    avg_speed = valid_speeds.float().mean().item()
-                    masks_speed_info[int(mask_id.item())] = avg_speed
+                    avg_speed = float(valid_speeds.mean())
+                    masks_speed_info[mask_id_int] = avg_speed
                 else:
                     # 没有有效速度数据
-                    masks_speed_info[int(mask_id.item())] = 100
+                    masks_speed_info[mask_id_int] = 100
         return frame, masks_speed_info, stopped_car, slow_car
 
 
 
-    def pause(self):
-        """暂停处理"""
-        self.pause_event.set()
-
-    def resume(self):
-        """恢复处理"""
-        self.pause_event.clear()
-
     def shutdown(self):
-        """安全关闭所有线程"""
-        # 先排空异步写入队列：趁写图线程还活着把已入队任务写完（避免 stop_event 提前终止导致 join() 死锁）
+        """安全关闭所有线程（线程全在 __init__ 启动，这里统一收尾）。"""
+        # 先排空异步写入队列：趁写图线程还活着把已入队任务写完
         self.save_queue.join()
-        # 放入哨兵，让写图线程立即退出（而非空等 0.5s 超时）
-        self.save_queue.put(None)
-        # 再置停止标志，让车道/车辆 worker 退出循环
-        self.stop_event.set()
-        self.lane_thread.join(timeout=1.0)
-        self.vehicle_thread.join(timeout=1.0)
-        # self.accident_thread.join(timeout=1.0)  # 事故检测暂时关闭，后续再改
-        self.save_thread.join(timeout=2.0)
-
-    # ==================== 向后兼容方法 ====================
-
-    def process_frame_compat(self, frame: np.ndarray, width: int, height: int,
-                            stop_car_flag: bool = True, slow_car_flag: bool = True,
-                            crowd_flag: bool = True, accident_flag: bool = True) -> Tuple[np.ndarray, List, List, List, List, List, List, Optional[str]]:
-        """
-        向后兼容的 process_frame 接口
-
-        Returns:
-            (frame, bike, person, stop_car, slow_car, crowd, accident, filename)
-        """
-        # 映射旧参数到新功能开关（拥堵/密度现为基本内容，始终启用）；临时写入 config，处理完恢复
-        saved_stop_slow = self.config.enable_stop_slow
-        saved_accident = self.config.enable_accident
-        self.config.enable_stop_slow = stop_car_flag or slow_car_flag
-        self.config.enable_accident = accident_flag
-        try:
-            result = self.process_frame(frame)
-        finally:
-            self.config.enable_stop_slow = saved_stop_slow
-            self.config.enable_accident = saved_accident
-
-        # 从统一的异常事件中还原旧的分类结果（拥堵区域已改为标志位，返回空列表）
-        def _detections(event_type: AbnormalEventType) -> List:
-            for e in result.abnormal_events:
-                if e.event_type == event_type:
-                    return e.detections
-            return []
-
-        return (
-            result.frame,
-            _detections(AbnormalEventType.BIKE),
-            _detections(AbnormalEventType.PERSON),
-            _detections(AbnormalEventType.STOPPED_VEHICLE),
-            _detections(AbnormalEventType.SLOW_VEHICLE),
-            [],  # 拥堵区域不再返回，仅保留标志位 result.traffic_congestion
-            _detections(AbnormalEventType.ACCIDENT),
-            result.output_filename
-        )
-
-
+        self.save_queue.put(None)      # 写图线程哨兵
+        self.stop_event.set()          # 举停止旗：所有线程跑完手头这轮后退出
+        for t, to in ((self.segment_thread, 1.0), (self.post_thread, 1.0),
+                      (self.lane_thread, 1.0), (self.vehicle_thread, 1.0),
+                      (self.save_thread, 2.0)):
+            t.join(timeout=to)
 
     def get_current_frame_objects(self, data, attention_id=2, get_scaling_factor=True):
         marge = 25
@@ -927,6 +924,7 @@ class TrafficAnalyzer:
         self.previous_frame_lines = current_frame_objects.copy()
         return int(0.2 * v_average + 0.8 * self.past_drone_speed)
 
+    # ---- V 节点子步骤：车辆框按道路掩码分组（GPU 内完成；末列为掩码索引）----
     def _group_by_mask(self, masks_tensor: torch.Tensor, vehicle_results: List) -> torch.Tensor:
         """按道路掩码给车辆检测框分组，返回 [N, 7] 张量（x1,y1,x2,y2,conf,cls + 掩码索引列，无掩码为 -1）。
 
@@ -959,31 +957,28 @@ class TrafficAnalyzer:
 
         return torch.cat([boxes_data_tensor, indices.unsqueeze(1)], dim=1)
 
-    def _process_bike_person(self, frame: np.ndarray, vehicle_results: List) -> Tuple[List, List]:
+    # ---- P 子步骤 1：自行车/行人检测框分类（可选，受 enable_bike_person 控制）----
+    def _process_bike_person(self, frame: np.ndarray, boxes_np: Optional[np.ndarray]) -> Tuple[List, List]:
         """在 frame 上绘制自行车/行人检测框，返回各自框坐标列表。
 
         Args:
             frame: 可视化用图像（BGR, H×W×3, numpy, CPU 内存），会被原地绘制
-            vehicle_results: 车辆模型推理结果（Ultralytics Results 列表，非 Tensor）
+            boxes_np: 车辆模型检测框数组（worker 内已 CPU 化，列含义与 boxes.data 完全一致）
 
         说明：
-            先对 boxes.data 做一次批量 .cpu() 取回，再用向量化掩码按类别过滤，
-            替代原实现逐框 int(box.cls)/int(box.xyxy) 触发的 N 次 GPU→CPU 同步；
+            直接对 numpy 数组做向量化按类别过滤，无 GPU→CPU 同步；
             目标类别固定为 bike=0 / person=3（bus/car/truck 不绘制）。
         """
         bike, person = [], []
-        boxes = getattr(vehicle_results[0], "boxes", None)
-        if boxes is None or boxes.data.numel() == 0:
+        if boxes_np is None or boxes_np.size == 0:
             return bike, person
 
-        # [N, 6]: x1,y1,x2,y2,conf,cls —— 单次批量搬运到 CPU，后续无设备同步
-        data_cpu = boxes.data.cpu().numpy()
-        cls = data_cpu[:, 5]
+        cls = boxes_np[:, 5]
 
         # 车辆模型 5 类：0 bike / 1 bus / 2 car / 3 person / 4 truck
         for class_id, targets in ((0, bike), (3, person)):
             label = "bike" if class_id == 0 else "person"
-            for x1, y1, x2, y2 in data_cpu[cls == class_id, :4].astype(int):
+            for x1, y1, x2, y2 in boxes_np[cls == class_id, :4].astype(int):
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -991,99 +986,83 @@ class TrafficAnalyzer:
 
         return bike, person
 
-    # 事故检测暂时关闭，后续再改
-    # def _process_accident(self, frame: np.ndarray, boxes_data) -> List:
-    #     """处理事故检测结果"""
-    #     accidents = []
-    #     if boxes_data is None or len(boxes_data) == 0:
-    #         return accidents
-    #
-    #     for box in boxes_data:
-    #         x1, y1, x2, y2 = map(int, box.xyxy[0])
-    #         conf = float(box.conf[0]) if hasattr(box, 'conf') else 0.0
-    #         label = f"accident {conf:.2f}"
-    #         # 绘制红色框标记事故
-    #         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-    #         cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    #         accidents.append([x1, y1, x2, y2, conf])
-    #     return accidents
-
-    def _process_traffic_density(self, image: np.ndarray, masks_tensor: torch.Tensor, boxes_data_tensor: torch.Tensor) -> Tuple[np.ndarray, Dict]:
+    # ---- P 子步骤 2：各道路块密度统计（纯 CPU，吃 masks_np + 车辆框）----
+    def _process_traffic_density(self, image: np.ndarray, masks_np: np.ndarray, boxes_data_np: np.ndarray) -> Tuple[np.ndarray, Dict]:
         """
-        统计各道路掩码区域内的车辆密度并标注到图像上。
+        统计各道路掩码区域内的车辆密度并标注到图像上（纯 CPU numpy 实现）。
 
         Args:
             image: 待标注图像（BGR, numpy 数组）
-            masks_tensor: 道路掩码张量 [num_masks, H, W]，位于 segment_device
-            boxes_data_tensor: 车辆分组结果 [N, 7]（x1,y1,x2,y2,conf,cls,掩码索引），位于 GPU；
+            masks_np: 道路掩码数组 [num_masks, H, W]（float32，CPU），由 _segment_road 一并产出
+            boxes_data_np: 车辆分组结果（末列为掩码索引，CPU numpy），由 vehicle worker 产出；
                 可能为空（无车辆框），此时所有掩码密度补 0，保证返回结构完整
 
         Returns:
             image: 标注后的图像
             density_info: {mask_id: traffic_density}，无有效车辆时所有掩码密度为 0
         """
-        # 将数据转移到GPU
-        device = masks_tensor.device
         height, width = image.shape[:2]
         font_scale = 0.45
         thickness = 1
         car_pixels = 16200 / self.scaling_factor / self.scaling_factor
 
+        masks_f = masks_np.astype(np.float32, copy=False)
 
-        # ===== GPU加速部分 =====
-        # 1. 向量化计算每个掩码的质心（消除 Python for 循环）
-        y_coords, x_coords = torch.meshgrid(
-            torch.arange(height, device=device),
-            torch.arange(width, device=device),
-            indexing='ij'
-        )
+        # ===== CPU 统计部分（等价于原 GPU 向量化实现；坐标网格只生成一次并缓存，避免每帧重建） =====
+        if (self._density_yf is None or self._density_H != height or self._density_W != width):
+            # [H*W] 每像素对应的行号 / 列号（行主序展开，与 masks_np.reshape(N, -1) 对应）
+            self._density_yf = np.repeat(np.arange(height), width).astype(np.float32)
+            self._density_xf = np.tile(np.arange(width), height).astype(np.float32)
+            self._density_H, self._density_W = height, width
 
-        # masks_tensor: [N, H, W] -> weights: [N, H, 1] * [1, H, W] and [N, 1, W] * [1, H, W]
-        mask_sums = masks_tensor.sum(dim=(1, 2)).clamp(min=1)  # [N]
-        centroid_y = (masks_tensor * y_coords.unsqueeze(0)).sum(dim=(1, 2)) // mask_sums
-        centroid_x = (masks_tensor * x_coords.unsqueeze(0)).sum(dim=(1, 2)) // mask_sums
-        centroids = torch.stack([centroid_y.long(), centroid_x.long()], dim=1).to(torch.int32)  # [N, 2]
+        m = masks_f.reshape(masks_f.shape[0], -1)          # [N, H*W]
+        yf, xf = self._density_yf, self._density_xf
 
-        # 2. 在GPU上统计车辆信息
+        # 1. 一次矩阵乘法算出所有掩码的面积与质心（与 torch 的 sum // 后 .long() 等价）
+        mask_sums = m.sum(axis=1)                          # [N]
+        denom = np.maximum(mask_sums, 1.0)
+        centroid_y = np.floor((m @ yf) / denom).astype(np.int64)
+        centroid_x = np.floor((m @ xf) / denom).astype(np.int64)
+        centroids = np.stack([centroid_y, centroid_x], axis=1).astype(np.int32)   # [N, 2]
+
+        # 2. 统计每个掩码区域内的车辆信息
         area_statistics = {}
         total_vehicles = 0
 
-        if boxes_data_tensor.numel() == 0:
+        if boxes_data_np is None or boxes_data_np.size == 0:
             # 无车辆框：为每个掩码补 0 密度，保证返回的 density_info 结构完整（而非空字典）
-            for mask_id in range(masks_tensor.shape[0]):
+            for mask_id in range(masks_f.shape[0]):
                 area_statistics[mask_id] = {
                     'vehicle_count': 0,
                     'traffic_density': 0.0,
-                    'centroid': centroids[mask_id].cpu().numpy()
+                    'centroid': centroids[mask_id]
                 }
         else:
-            # 获取有效的掩码ID（忽略 -1）
-            valid_mask_ids = boxes_data_tensor[boxes_data_tensor[:, -1] >= 0, -1]
-            unique_mask_ids = torch.unique(valid_mask_ids).long() if len(valid_mask_ids) > 0 else torch.tensor([],
-                                                                                                               device=device)
+            # 末列为掩码索引；只统计落在道路掩码内（>=0）的车辆
+            mask_col = boxes_data_np[:, -1]
+            valid_mask_ids = np.unique(mask_col[mask_col >= 0])
 
-            for mask_id in unique_mask_ids:
-                mask_id_int = mask_id.item()
-                mask_boxes = boxes_data_tensor[boxes_data_tensor[:, -1] == mask_id]
-                vehicle_count = mask_boxes.shape[0]
+            for mask_id in valid_mask_ids:
+                mask_id_int = int(mask_id)
+                mask_boxes = boxes_data_np[mask_col == mask_id]
+                vehicle_count = int(mask_boxes.shape[0])
                 total_vehicles += vehicle_count
 
-                mask = masks_tensor[mask_id_int]
-                area_pixels = mask.sum().item()
+                area_pixels = float(mask_sums[mask_id_int])
                 traffic_density = car_pixels * vehicle_count / area_pixels if area_pixels > 0 else 0
                 traffic_density = min(traffic_density, 0.99)  # 限制最大密度
 
                 area_statistics[mask_id_int] = {
                     'vehicle_count': vehicle_count,
                     'traffic_density': traffic_density,
-                    'centroid': centroids[mask_id_int].cpu().numpy()
+                    'centroid': centroids[mask_id_int]
                 }
 
         # ===== CPU可视化部分 =====
         # 3. 在每个掩码区域上标注掩码ID（使用质心位置）
-        centroids_cpu = centroids.cpu().numpy()
+        centroids_cpu = centroids  # 已是 numpy 数组
 
-        for mask_id in range(masks_tensor.shape[0]):
+        for mask_id in range(masks_np.shape[0]):
             # mask = masks_np[mask_id]
             # if not np.any(mask):
             #     continue
@@ -1156,7 +1135,9 @@ class TrafficAnalyzer:
             y_offset += 30  # 下移一行
         return image, density_statistics
 
-    def _evaluate_congestion(self, frame: np.ndarray, mask_density_info: Dict, mask_speed_info: Dict, vehicle_results_boxes: torch.Tensor) -> Tuple[np.ndarray, Dict, List]:
+    # ---- P 子步骤 4：拥堵评估（读密度 + 速度结果，产出拥堵标志/区域）----
+    def _evaluate_congestion(self, frame: np.ndarray, mask_density_info: Dict, mask_speed_info: Dict, vehicle_results_boxes: np.ndarray) -> Tuple[np.ndarray, Dict, List]:
+        # vehicle_results_boxes 为 CPU numpy（末列为掩码索引）；numpy 同样支持 min/item/布尔索引，逻辑不变
         crowd = []
         common_keys = set(mask_density_info.keys()) & set(mask_speed_info.keys())
         combined_dict = {key: [mask_density_info[key], mask_speed_info[key] / 100, (1 - mask_density_info[key] + mask_speed_info[key] / 100) / 2] for key in common_keys}
