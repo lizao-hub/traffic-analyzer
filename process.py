@@ -4,7 +4,7 @@ process.py — 交通视频帧间流水线引擎
 
 一帧的数据流（S → L∥V → P）
     一帧图
-      → [S 分割   cuda:0] 产出 masked_frame / overlay_frame / road_masks(GPU) / masks_np(CPU)
+      → [S 分割   cuda:0] 产出 masked_frame / overlay_frame / masks_tensor(GPU) / masks_np(CPU)
       → 并行分发给两个 worker：
           ├→ [L 车道   cuda:2] 车道线 track → lane_boxes(numpy)
           └→ [V 车辆   cuda:1] 车辆 track + 按掩码分组 → (boxes, grouped)(numpy)
@@ -21,6 +21,7 @@ process.py — 交通视频帧间流水线引擎
     submit_frame(frame)  提交一帧 → 返回 seq（有界队列满时阻塞 = 背压，不丢帧）
     get_result(timeout)  按帧号顺序取回 (seq, ProcessFrameResult)
     close_pipeline()     收尾（请先 get_result 取完全部结果再调用）
+    process_frame(frame) 单帧阻塞版：帧内 DAG 编排（S → L∥V → P），单图/调试用；勿与流水线会话并发使用
     reset_video_state()  一段视频/一次会话开始前调用（清跨帧状态）
     shutdown()           进程退出时关闭所有线程
 
@@ -43,6 +44,9 @@ import cv2
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from ultralytics import YOLO
 
 
@@ -91,12 +95,26 @@ class TrafficAnalyzer:
     VEHICLE_MODEL_PATH = "./runs/hz/vehicle/weights/best.pt"
     LANE_MODEL_PATH = "./runs/hz/line/weights/best.pt"
 
-    SEGMENT_DEVICE = "cuda:0"
-    VEHICLE_DEVICE = "cuda:1"
-    LANE_DEVICE = "cuda:2"
+    SEGMENT_DEVICE = "cuda:4"
+    VEHICLE_DEVICE = "cuda:5"
+    LANE_DEVICE = "cuda:6"
 
     INPUT_WIDTH = 960
     INPUT_HEIGHT = 540
+
+    # L/V 检测推理分辨率（长边）。
+    # 注意：不显式传 imgsz 时，ultralytics 会沿用 best.pt 训练参数里的 960（960x960 方形），
+    # 实测 yolo11m 在该尺寸约 180-190ms/帧（还是与另一路并发）。调小立即可加速，代价是精度：
+    #   640 → 像素量约为 960 的 44%，约 2.2x 加速；512 → 约 28%，约 3.5x。
+    # 推荐从 640 起测（视频本身就是 960x540，640 长边足够），远小目标多时再酌情上调。
+    TRACK_IMGSZ = 640
+
+    # 推理串行开关。本机（多 RTX4080 共享机）实测：Python 线程同时驱动多张 GPU 推理会
+    # 灾难性串行化——单路 predict ~15ms，一旦两路并发每路变 ~250ms（且与限制 torch/cv2
+    # 线程数无关，S∥V、L∥V 都如此）；而顺序执行两路仅 ~46ms。
+    # 因此默认 True：S/L/V 任一时刻只跑一个模型（单帧 S→L→V→P，~65ms/帧）。
+    # 若部署机线程级多 GPU 并发正常，可置 False 恢复三卡并行。
+    SERIAL_INFERENCE = True
 
     def __init__(self, config: Optional[DetectionConfig] = None):
         """
@@ -106,6 +124,8 @@ class TrafficAnalyzer:
             config: 客户端配置（仅功能开关与输出目录），默认使用默认配置
         """
         self.config = config or DetectionConfig()
+        # 推理串行锁：SERIAL_INFERENCE=True 时 S/L/V 的 GPU 推理互斥（见类常量说明）
+        self._infer_lock = threading.RLock()
 
         # 透视变换矩阵（固定标定，写死在类内）
         pts1 = np.float32([(450, 674), (750, 674), (500, 50), (700, 50)])
@@ -136,7 +156,6 @@ class TrafficAnalyzer:
         self.lane_queue = queue.Queue(maxsize=2)     # → L worker
         self.vehicle_queue = queue.Queue(maxsize=2)  # → V worker
         self.out_queue = queue.Queue(maxsize=16)     # P 输出：按帧号顺序，供 get_result 取
-        self.save_queue = queue.Queue(maxsize=30)    # → 写图线程（满了丢弃异常事件图，不阻塞）
 
         # 结果存储：按 seq 对齐各模型结果  L worker 和 V worker 是两个独立的线程、各跑各的 GPU，它们处理同一帧的快慢不一样
         self.lane_results = {}
@@ -155,7 +174,7 @@ class TrafficAnalyzer:
         # 控制标志
         self.stop_event = threading.Event()
 
-        # 启动所有线程（同寿命：S/P/L/V/写图 全部在 __init__ 启动，之后不再创建线程）
+        # 启动所有线程（同寿命：S/P/L/V 全部在 __init__ 启动，之后不再创建线程）
         self._start_workers()
 
         self.scaling_factor = 3.0
@@ -172,20 +191,89 @@ class TrafficAnalyzer:
 
 
 
+    @contextmanager
+    def _infer_guard(self):
+        """推理互斥上下文：SERIAL_INFERENCE=True 时串行化 S/L/V 的 GPU 推理。
+        本机实测线程级多 GPU 并发是负优化（~15ms→~250ms/路），串行反而最快；
+        并发正常的机器可把 SERIAL_INFERENCE 置 False 直接透传。
+        """
+        if self.SERIAL_INFERENCE:
+            with self._infer_lock:
+                yield
+        else:
+            yield
+
     def _start_workers(self):
         """启动全部线程（同一寿命，只在 __init__ 调用一次，之后不再创建线程）。"""
         self.segment_thread = threading.Thread(target=self._pipeline_segment_worker, name="Seg", daemon=True)
         self.post_thread = threading.Thread(target=self._pipeline_post_worker, name="P", daemon=True)
         self.lane_thread = threading.Thread(target=self._lane_worker, name="LaneWorker", daemon=True)
         self.vehicle_thread = threading.Thread(target=self._vehicle_worker, name="VehicleWorker", daemon=True)
-        self.save_thread = threading.Thread(target=self._async_writer_worker, name="SaveWriter", daemon=True)
         for t in (self.segment_thread, self.post_thread, self.lane_thread,
-                  self.vehicle_thread, self.save_thread):
+                  self.vehicle_thread):
             t.start()
 
+    # ============================================================
+    # L 节点（车道, GPU cuda:2）—— 对应伪代码 _node_lane
+    # 单帧同步节点：track 车道线后 CPU 化，供流水线 worker 与单帧 DAG（process_frame）复用。
+    # 线程安全前提：同一模型对象只能被一个调用方串行使用（worker 单飞 / 单帧与流水线互斥）。
+    # ============================================================
+    def _node_lane(self, masked_frame: np.ndarray) -> Optional[np.ndarray]:
+        """车道线检测节点（推理串行锁入口）。"""
+        with self._infer_guard():
+            return self._node_lane_impl(masked_frame)
+
+    def _node_lane_impl(self, masked_frame: np.ndarray) -> Optional[np.ndarray]:
+        """车道线 track → numpy；返回 (N,6) 或含 id 列的框数组；无检出返回 None。"""
+        results = self.lane_model.track(
+            masked_frame,
+            persist=True,
+            save=False,
+            verbose=False,
+            half=True,
+            imgsz=self.TRACK_IMGSZ,
+            tracker="bytetrack.yaml",
+            device=self.lane_device,
+        )
+        # CPU 化边界：只把下游所需的 boxes.data 转成 numpy（不再传递 Results 对象）
+        lane_boxes = None
+        if results:
+            boxes = getattr(results[0], "boxes", None)
+            lane_boxes = boxes.data.cpu().numpy() if (boxes is not None and boxes.data.numel() > 0) else None
+        return lane_boxes
 
     # ============================================================
-    # L 节点 worker 线程（车道, GPU cuda:2）—— 对应伪代码 _node_lane
+    # V 节点（车辆, GPU cuda:1）—— 对应伪代码 _node_vehicle
+    # 单帧同步节点：车辆 track + 按道路掩码分组（GPU 内完成）→ numpy 数据包，
+    # 供流水线 worker 与单帧 DAG（process_frame）复用。
+    # ============================================================
+    def _node_vehicle(self, masked_frame: np.ndarray, masks_tensor: torch.Tensor) -> Optional[Tuple]:
+        """车辆检测+分组节点（推理串行锁入口）。"""
+        with self._infer_guard():
+            return self._node_vehicle_impl(masked_frame, masks_tensor)
+
+    def _node_vehicle_impl(self, masked_frame: np.ndarray, masks_tensor: torch.Tensor) -> Optional[Tuple]:
+        """车辆 track + 按掩码分组（GPU 内完成）→ numpy 数据包；无车辆检出时 boxes 为 None。"""
+        results = self.vehicle_model.track(
+            masked_frame,
+            persist=True,
+            save=False,
+            verbose=False,
+            half=True,
+            imgsz=self.TRACK_IMGSZ,
+            tracker="bytetrack.yaml",
+            device=self.vehicle_device
+        )
+        # 分组在节点内于 GPU 完成，下游（P）不再触碰 GPU 张量
+        boxes_np, grouped_np = None, None
+        if results:
+            boxes = getattr(results[0], "boxes", None)
+            boxes_np = boxes.data.cpu().numpy() if (boxes is not None and boxes.data.numel() > 0) else None
+            grouped_np = self._group_by_mask(masks_tensor, results).cpu().numpy()
+        return (boxes_np, grouped_np)
+
+    # ============================================================
+    # L 节点 worker 线程（车道, GPU cuda:2）—— 调用 _node_lane
     # 消费 Seg 分发来的任务 (seq, masked_frame)，车道线 track 后把结果转成 numpy
     # 存入 lane_results[seq]，并 notify P 线程；任务帧号即流水线 seq。
     # ============================================================
@@ -201,22 +289,8 @@ class TrafficAnalyzer:
                 # 任务来自 Seg 线程： (seq, masked_frame)
                 frame_id, masked_frame = task
 
-                # 执行车道线检测
-                results = self.lane_model.track(
-                    masked_frame,
-                    persist=True,
-                    save=False,
-                    verbose=False,
-                    half=True,
-                    device=self.lane_device,
-                    conf=0.5
-                )
-
-                # CPU 化边界：只把下游所需的 boxes.data 转成 numpy 存入结果字典（不再传递 Results 对象）
-                lane_boxes = None
-                if results:
-                    boxes = getattr(results[0], "boxes", None)
-                    lane_boxes = boxes.data.cpu().numpy() if (boxes is not None and boxes.data.numel() > 0) else None
+                # L 节点逻辑在 _node_lane 内（单飞由本 worker 串行消费保证）
+                lane_boxes = self._node_lane(masked_frame)
 
                 # 按 frame_id 存入结果字典并通知等待方
                 with self.results_cond:
@@ -231,7 +305,7 @@ class TrafficAnalyzer:
 
     # ============================================================
     # V 节点 worker 线程（车辆, GPU cuda:1）—— 对应伪代码 _node_vehicle
-    # 消费 Seg 分发来的任务 (seq, masked_frame, road_masks)：
+    # 消费 Seg 分发来的任务 (seq, masked_frame, masks_tensor)：
     # 车辆 track + _group_by_mask(按道路掩码分组，GPU 内完成) → numpy 数据包
     # (boxes, grouped) 存入 vehicle_results[seq]，并 notify P 线程。
     # ============================================================
@@ -244,26 +318,11 @@ class TrafficAnalyzer:
                 if task is None:
                     continue
 
-                # 任务来自 Seg 线程： (seq, masked_frame, road_masks)
-                frame_id, masked_frame, road_masks = task
+                # 任务来自 Seg 线程： (seq, masked_frame, masks_tensor)
+                frame_id, masked_frame, masks_tensor = task
 
-                # 执行车辆检测和跟踪
-                results = self.vehicle_model.track(
-                    masked_frame,
-                    persist=True,
-                    save=False,
-                    verbose=False,
-                    half=True,
-                    tracker="bytetrack.yaml",
-                    device=self.vehicle_device
-                )
-
-                # 分组（_group_by_mask）在 worker 内于 GPU 完成，下游（P 线程）不再触碰 GPU 张量
-                boxes_np, grouped_np = None, None
-                if results:
-                    boxes = getattr(results[0], "boxes", None)
-                    boxes_np = boxes.data.cpu().numpy() if (boxes is not None and boxes.data.numel() > 0) else None
-                    grouped_np = self._group_by_mask(road_masks, results).cpu().numpy()
+                # V 节点逻辑在 _node_vehicle 内（单飞由本 worker 串行消费保证）
+                boxes_np, grouped_np = self._node_vehicle(masked_frame, masks_tensor)
 
                 # CPU 化边界：存入 (原始框数组, 分组后数组) 数据包，不再传递 Results 对象
                 with self.results_cond:
@@ -276,35 +335,17 @@ class TrafficAnalyzer:
             except Exception as e:
                 print(f"Vehicle worker error: {e}")
 
-    def _async_writer_worker(self):
-        """异步图片写入工作线程"""
-        while not self.stop_event.is_set():
-            try:
-                item = self.save_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if item is None:
-                break
-            path, img = item
-            try:
-                cv2.imwrite(path, img)
-            except Exception as e:
-                print(f"图片写入失败 {path}: {e}")
-            finally:
-                # 无论成败都标记完成，保证 shutdown() 的 join() 能正常返回
-                self.save_queue.task_done()
-
     # ============================================================
     # P 节点入口（后处理, 纯 CPU）—— 对应伪代码 _node_post_process
     # 由流水线 P 线程按帧号顺序调用：空检守卫 → 自行车/行人 → 密度 → 速度 → 拥堵
     # → 异常事件 → ProcessFrameResult。所有跨帧状态都只在这里被串行更新。
     # ============================================================
-    def _run_post_stage(self, raw_frame: np.ndarray, lane_boxes, veh_pkt,
+    def _run_post_stage(self, lane_boxes, veh_pkt,
                         overlay_frame: np.ndarray, masks_np: np.ndarray) -> ProcessFrameResult:
         """统一空检出守卫 + P 阶段（纯 CPU，含跨帧状态）。
 
-        由流水线 P 线程调用；raw_frame 为已 resize 的原始帧（异常返回时作为画面）；
-        lane_boxes / veh_pkt 为 worker 产出的 numpy 数据包。
+        由流水线 P 线程调用；lane_boxes / veh_pkt 为 worker 产出的 numpy 数据包；
+        overlay_frame 为分割阶段产出的叠加帧，正常与异常返回都作为画面。
         """
         enable_bike_person = self.config.enable_bike_person
         enable_stop_slow = self.config.enable_stop_slow
@@ -315,18 +356,18 @@ class TrafficAnalyzer:
         #   - 车道线模型没追踪到车道框 → 速度计算无车道依据；
         #   - 车辆模型没追踪到车辆框 → 与分割/车道结果矛盾，同样按异常帧处理。
         if lane_boxes is None or lane_boxes.shape[0] == 0:
-            result = ProcessFrameResult(frame=raw_frame.copy())
+            result = ProcessFrameResult(frame=overlay_frame.copy())
             result.is_abnormal = True
             return result
 
         if veh_pkt is None:
-            result = ProcessFrameResult(frame=raw_frame.copy())
+            result = ProcessFrameResult(frame=overlay_frame.copy())
             result.is_abnormal = True
             return result
 
         veh_boxes_np, vehicle_boxes = veh_pkt
         if veh_boxes_np is None or veh_boxes_np.shape[0] == 0:
-            result = ProcessFrameResult(frame=raw_frame.copy())
+            result = ProcessFrameResult(frame=overlay_frame.copy())
             result.is_abnormal = True
             return result
 
@@ -370,11 +411,88 @@ class TrafficAnalyzer:
             result.output_filename = self._save_abnormal_event(overlay_frame)
         return result
 
+    # ==================== 单帧入口（帧内 DAG 编排，同步阻塞） ====================
+    # 依赖图：帧 → [S 分割 cuda:0] → {L 车道 cuda:2 ∥ V 车辆 cuda:1} → [P 后处理 CPU]
+    # fork：S 完成后把 L / V 派发到两个线程并行执行（两张不同 GPU）；
+    # join：两条支路都完成后才进入 P（P 依赖 L、V 的全部产物）。
+    # 与下面的帧间流水线（start_pipeline/submit_frame/get_result）为两种使用方式：
+    # 本函数一次调用同步处理一帧并返回结果（等价伪代码 process_pipeline 的阻塞版），
+    # 不占用任何流水线队列，适合单图/单帧调试；调用时勿与流水线会话并发（模型单飞约束）。
+
+    def process_frame(self, frame: np.ndarray) -> ProcessFrameResult:
+        """单帧同步处理（帧内 DAG 编排：S → L∥V → P）。
+
+        Args:
+            frame: 输入帧（BGR, H×W×3, numpy 数组），尺寸不限（内部 resize 到输入尺寸）
+
+        Returns:
+            ProcessFrameResult：与 get_result 产出同构；本帧未正常处理时 is_abnormal=True。
+        """
+        # ---- 第 1 步：S 节点（分割, GPU cuda:0）----
+        if frame.shape[0] != self.input_height or frame.shape[1] != self.input_width:
+            frame = cv2.resize(frame, (self.input_width, self.input_height))
+
+        masked_frame, overlay_frame, masks_tensor, masks_np = self._segment_road(frame)
+
+        # 分割未检出道路 → 该帧按异常产出（与流水线行为一致，不进入下游 L/V/P）
+        if masks_np is None:
+            return ProcessFrameResult(frame=frame.copy(), is_abnormal=True)
+
+        # ---- 第 2 步：L、V 节点 ----
+        # 本机实测（多 GPU 共享机）：每帧新建线程跑推理 ~300ms/路，而主线程/常驻线程顺序
+        # 执行只要 ~30ms（SERIAL_INFERENCE 说明见类常量）。串行模式下直接在调用线程顺序跑
+        # L→V；只有并发正常的机器（SERIAL_INFERENCE=False）才走线程 fork 并行。
+        lane_box, veh_pkt = {}, {}
+
+        if self.SERIAL_INFERENCE:
+            try:
+                lane_box["v"] = self._node_lane(masked_frame)
+            except Exception as e:
+                print(f"process_frame L 节点错误: {e}")
+                lane_box["v"] = None
+            try:
+                veh_pkt["v"] = self._node_vehicle(masked_frame, masks_tensor)
+            except Exception as e:
+                print(f"process_frame V 节点错误: {e}")
+                veh_pkt["v"] = None
+        else:
+            def _run_l():
+                try:
+                    lane_box["v"] = self._node_lane(masked_frame)
+                except Exception as e:
+                    print(f"process_frame L 节点错误: {e}")
+                    lane_box["v"] = None
+
+            def _run_v():
+                try:
+                    veh_pkt["v"] = self._node_vehicle(masked_frame, masks_tensor)
+                except Exception as e:
+                    print(f"process_frame V 节点错误: {e}")
+                    veh_pkt["v"] = None
+
+            t_l = threading.Thread(target=_run_l)
+            t_v = threading.Thread(target=_run_v)
+            t_l.start()
+            t_v.start()
+            # ---- join —— 等待两条支路全部完成，再进入 P ----
+            t_l.join()
+            t_v.join()
+
+        # ---- 第 3 步：P 节点（纯 CPU 后处理；内部含空检守卫）----
+        try:
+            return self._run_post_stage(
+                lane_box["v"], veh_pkt["v"], overlay_frame, masks_np
+            )
+        except Exception as e:
+            print(f"process_frame P 节点错误: {e}")
+            return ProcessFrameResult(frame=frame.copy(), is_abnormal=True)
+
     # ==================== 帧间流水线（异步编排 + 阶段线程执行，多帧重叠） ====================
     # 拓扑：  提交(S队列) → [Seg线程:cuda0] → {Lane队列:cuda2, Vehicle队列:cuda1} → [P线程:CPU]
     # 每个阶段都是“单消费者 FIFO”：天然保序（追踪器跨帧状态安全）且单飞（模型线程安全）；
     # 相邻帧可同时处于不同阶段 → 不同 GPU/CPU 资源重叠使用。
     # 本文件为“纯流水线版”：对外入口就是下面的 start_pipeline/submit_frame/get_result/close_pipeline。
+    # 单图/单帧调试请用上面的 process_frame（阻塞式，勿与流水线会话并发调用）。
 
     def start_pipeline(self):
         """开始一个新的流水线会话（线程已在 __init__ 常驻，这里只复位会话状态）。"""
@@ -446,7 +564,7 @@ class TrafficAnalyzer:
             try:
                 if frame.shape[0] != self.input_height or frame.shape[1] != self.input_width:
                     frame = cv2.resize(frame, (self.input_width, self.input_height))
-                masked_frame, overlay_frame, road_masks, masks_np = self._segment_road(frame)
+                masked_frame, overlay_frame, masks_tensor, masks_np = self._segment_road(frame)
             except Exception as e:
                 print(f"PipeSeg error: {e}")
                 with self.results_cond:
@@ -463,7 +581,7 @@ class TrafficAnalyzer:
 
             # 阻塞入队（超时保护），保证不丢帧、不破坏帧号顺序
             self.lane_queue.put((seq, masked_frame), timeout=60.0)
-            self.vehicle_queue.put((seq, masked_frame, road_masks), timeout=60.0)
+            self.vehicle_queue.put((seq, masked_frame, masks_tensor), timeout=60.0)
             with self.results_cond:
                 self.seg_payload[seq] = (frame, overlay_frame, masks_np)
                 self.results_cond.notify_all()
@@ -489,12 +607,13 @@ class TrafficAnalyzer:
                 if not seg_ready:
                     if (self._pipeline_total is not None and seq >= self._pipeline_total
                             and self._seg_done):
-                        # 本会话全部帧已处理完：通知 close_pipeline，复位帧号，等开关关闭后进入空闲
+                        # 本会话全部帧已处理完：通知 close_pipeline，复位帧号，回循环顶。
+                        # 注意：不能在这里 while _pipeline_on 空等——close_pipeline 置 False 后
+                        # 若新会话已 start（_pipeline_on 又变 True），本线程会永远空转，
+                        # 导致下一会话的帧全部卡在 L/V 结果里、P 永不产出（与 process_product 同源 bug）。
                         self._session_finished.set()
                         seq = 0
                         stall_since = None
-                        while self._pipeline_on and not self.stop_event.is_set():
-                            self.results_cond.wait(timeout=0.1)
                         continue
                 elif is_fail:
                     self.seg_payload.pop(seq)
@@ -536,9 +655,9 @@ class TrafficAnalyzer:
                     res = ProcessFrameResult(frame=raw.copy(), is_abnormal=True)
             else:
                 _, payload, lane_boxes, veh_pkt = ready
-                raw, overlay_frame, masks_np = payload
+                _, overlay_frame, masks_np = payload
                 try:
-                    res = self._run_post_stage(raw, lane_boxes, veh_pkt, overlay_frame, masks_np)
+                    res = self._run_post_stage(lane_boxes, veh_pkt, overlay_frame, masks_np)
                 except Exception as e:
                     # 单帧后处理异常 → 按异常帧产出，保证流水线不断
                     print(f"PipePost error seq={seq}: {e}")
@@ -562,14 +681,18 @@ class TrafficAnalyzer:
         return events
 
     def _save_abnormal_event(self, frame: np.ndarray) -> str:
-        """保存异常事件对应帧（一帧一张图，命名不含事件名称），返回输出文件名"""
+        """保存异常事件对应帧（一帧一张图，命名不含事件名称），返回输出文件名
+
+        在 P 阶段（_run_post_stage）内同步写盘：异常事件帧属于低频输出，
+        直接 cv2.imwrite 即可，无需再维护一个常驻写图线程。
+        """
         self.count += 1
         filename = f"{self.count:05d}.jpg"
         absolute_filename = os.path.join(self.output_dir, filename)
         try:
-            self.save_queue.put_nowait((absolute_filename, frame.copy()))
-        except queue.Full:
-            pass  # 队列满了丢弃，保证主流程不阻塞
+            cv2.imwrite(absolute_filename, frame)
+        except Exception as e:
+            print(f"图片写入失败 {absolute_filename}: {e}")
         return filename
 
     def _prune_results(self, result_dict, current_frame_id: int, keep: int = 32):
@@ -600,10 +723,15 @@ class TrafficAnalyzer:
 
     # ============================================================
     # S 节点（分割, GPU cuda:0）—— 对应伪代码 _node_segment
-    # 输入一帧 → 输出 masked_frame / overlay_frame / road_masks(GPU,给V) / masks_np(CPU,给P)；
+    # 输入一帧 → 输出 masked_frame / overlay_frame / masks_tensor(GPU,给V) / masks_np(CPU,给P)；
     # 分割为空时返回 (frame, frame, None, None)，由上层按异常帧处理。
     # ============================================================
     def _segment_road(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Optional[torch.Tensor], Optional[np.ndarray]]:
+        """分割节点（推理串行锁入口）：详见 _segment_road_impl。"""
+        with self._infer_guard():
+            return self._segment_road_impl(frame)
+
+    def _segment_road_impl(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Optional[torch.Tensor], Optional[np.ndarray]]:
         """
         道路分割并生成两类输出图像。
 
@@ -611,16 +739,16 @@ class TrafficAnalyzer:
             frame: 输入帧（BGR，H×W×3，numpy 数组）
 
         Returns:
-            (road_masked_frame, overlay_frame, road_masks, road_masks_np):
+            (road_masked_frame, overlay_frame, masks_tensor, masks_tensor_np):
                 road_masked_frame : 全遮蔽图像（道路外区域填充固定色），供目标检测模型使用
                 overlay_frame     : 半透明叠加图像（全遮蔽帧与原始帧加权融合），供可视化使用
-                road_masks        : 道路掩码张量（GPU，供 V worker 分组），未检测到道路时为 None
-                road_masks_np     : road_masks 的 CPU 副本（纯 numpy，供密度统计，P 阶段不碰 GPU）
+                masks_tensor        : 道路掩码张量（GPU，供 V worker 分组），未检测到道路时为 None
+                masks_tensor_np     : masks_tensor 的 CPU 副本（纯 numpy，供密度统计，P 阶段不碰 GPU）
 
         说明：
             - 掩码提取、全遮蔽帧生成、半透明融合均在 segment_device 上完成，
               避免中间结果在 GPU/CPU 间来回搬运；仅在收尾处一次性产出 CPU 掩码副本。
-            - 未检测到道路时回退为原帧，保证调用链不中断（road_masks 为 None 表示失败）。
+            - 未检测到道路时回退为原帧，保证调用链不中断（masks_tensor 为 None 表示失败）。
         """
         if frame is None or frame.size == 0:
             raise ValueError("_segment_road: 输入 frame 为空")
@@ -640,13 +768,13 @@ class TrafficAnalyzer:
         if not seg_results or seg_results[0].masks is None:
             return frame, frame, None, None
 
-        road_masks = self._extract_roi(seg_results[0].masks.data)
-        if road_masks is None:
+        masks_tensor = self._extract_roi(seg_results[0].masks.data)
+        if masks_tensor is None:
             return frame, frame, None, None
 
         # GPU 上同时生成全遮蔽帧与半透明叠加帧，一次前向 + 一次矩阵运算，无 CPU 往返
         with torch.no_grad():
-            keep_road = road_masks.any(dim=0).unsqueeze(0)      # [1, H, W]
+            keep_road = masks_tensor.any(dim=0).unsqueeze(0)      # [1, H, W]
             keep_road_3c = keep_road.expand(3, -1, -1)          # [3, H, W]
 
             # 遮蔽色（BGR）：与历史实现保持一致 [255, 0, 0]
@@ -659,27 +787,27 @@ class TrafficAnalyzer:
 
         masked_frame = masked_tensor.permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy()
         overlay_frame = overlay_tensor.permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy()
-        # 收尾处一次性产出 CPU 掩码副本：P 阶段密度统计不再触碰 GPU；GPU 版 road_masks 留给 V worker 分组
-        masks_np = road_masks.cpu().numpy()
+        # 收尾处一次性产出 CPU 掩码副本：P 阶段密度统计不再触碰 GPU；GPU 版 masks_tensor 留给 V worker 分组
+        masks_np = masks_tensor.cpu().numpy()
 
-        return masked_frame, overlay_frame, road_masks, masks_np
+        return masked_frame, overlay_frame, masks_tensor, masks_np
 
-    def reset_video_state(self):
-        """重置所有跨帧/跨视频状态，使同一实例可安全开始处理一段新视频。
-        适用于服务端复用同一 TrafficAnalyzer 连续处理多段视频/多次流式会话。
-        注意：不重置 self.count（事件保存文件名保持全局递增，避免重名覆盖）。"""
-        with self.results_cond:
-            self.lane_results.clear()
-            self.vehicle_results.clear()
-            if hasattr(self, 'seg_payload'):
-                self.seg_payload.clear()
-        # 跨帧追踪/速度状态（车道线、车辆轨迹、位移与缩放因子）
-        self.past_dis.clear()
-        self.previous_frame_objects = {}
-        self.previous_frame_lines = {}
-        self.past_drone_speed = 10.0
-        self.past_scaling_factor = 3.0
-        self.scaling_factor = 3.0
+    # def reset_video_state(self):
+    #     """重置所有跨帧/跨视频状态，使同一实例可安全开始处理一段新视频。
+    #     适用于服务端复用同一 TrafficAnalyzer 连续处理多段视频/多次流式会话。
+    #     注意：不重置 self.count（事件保存文件名保持全局递增，避免重名覆盖）。"""
+    #     with self.results_cond:
+    #         self.lane_results.clear()
+    #         self.vehicle_results.clear()
+    #         if hasattr(self, 'seg_payload'):
+    #             self.seg_payload.clear()
+    #     # 跨帧追踪/速度状态（车道线、车辆轨迹、位移与缩放因子）
+    #     self.past_dis.clear()
+    #     self.previous_frame_objects = {}
+    #     self.previous_frame_lines = {}
+    #     self.past_drone_speed = 10.0
+    #     self.past_scaling_factor = 3.0
+    #     self.scaling_factor = 3.0
 
     # ---- P 子步骤 3：按车道/道路块算速度、停止车与慢速车（跨帧状态，P 线程独占保序）----
     def _process_speed(self, frame: np.ndarray, lane_boxes_np: np.ndarray, vehicle_boxes_np: np.ndarray,
@@ -738,13 +866,9 @@ class TrafficAnalyzer:
 
     def shutdown(self):
         """安全关闭所有线程（线程全在 __init__ 启动，这里统一收尾）。"""
-        # 先排空异步写入队列：趁写图线程还活着把已入队任务写完
-        self.save_queue.join()
-        self.save_queue.put(None)      # 写图线程哨兵
         self.stop_event.set()          # 举停止旗：所有线程跑完手头这轮后退出
         for t, to in ((self.segment_thread, 1.0), (self.post_thread, 1.0),
-                      (self.lane_thread, 1.0), (self.vehicle_thread, 1.0),
-                      (self.save_thread, 2.0)):
+                      (self.lane_thread, 1.0), (self.vehicle_thread, 1.0)):
             t.join(timeout=to)
 
     def get_current_frame_objects(self, data, attention_id=2, get_scaling_factor=True):
@@ -1174,4 +1298,332 @@ class TrafficAnalyzer:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
         return frame, combined_dict, crowd
+
+
+# ============================================================================
+# TrafficAnalyzerLite —— 线程池精简版（帧内 DAG + 帧间流水线）
+# ----------------------------------------------------------------------------
+# 设计目标：可读性优先。对外只暴露 2 个入口，其余“会话 API”全部取消：
+#   process_frame(frame)     单帧：帧内 DAG（S → L∥V → P），同步阻塞
+#   process_frames(frames)   整段视频/帧流：帧间流水线，同步返回按帧序的结果列表
+#       （S(n+2) ∥ L/V(n+1) ∥ P(n) 三段阶梯重叠，每阶段单飞保序、模型永不并发调用）
+# 相比 TrafficAnalyzer 删除：start_pipeline / submit_frame / get_result /
+#   close_pipeline / reset_video_state 以及常驻线程/哨兵/会话开关 ——
+#   一段视频 = 一次调用，会话状态（跨帧追踪/速度缓存）在调用内开始并自动复位。
+# 单飞/保序由两个小原语统一表达（_SingleFlightStage / _OrderedStage），
+# S/L/V/P 的 DAG 拓扑集中在 4 个 work 函数里，一处即可看懂整条流水线。
+#
+# 注意：process_frame / process_frames 共用同一批模型与跨帧状态，已用 _entry_lock
+#   互斥：并发调用会阻塞等待，等效“一次只跑一个视频/会话”；跨帧状态每次调用前自动复位。
+# ============================================================================
+
+
+class _SingleFlightStage:
+    """阶段原语①：单飞 + FIFO 保序（供 S / L / V 使用）。
+
+    同一时刻本阶段至多执行一帧；待处理任务按投递顺序排队，即天然保帧序。
+    空闲时不占用线程——有活才向池子借一条线程，干完/干到队空即归还。
+    """
+
+    def __init__(self, pool: ThreadPoolExecutor, work):
+        self._pool = pool
+        self._work = work
+        self._q = deque()          # 待处理任务（FIFO）
+        self._busy = False         # 本阶段是否正有一帧在跑
+        self._lock = threading.Lock()
+
+    def put(self, job):
+        """投递任务：立即返回（不阻塞调用者）。"""
+        with self._lock:
+            self._q.append(job)
+            if not self._busy:
+                self._busy = True
+                self._pool.submit(self._run)
+
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._q:          # 排空则“下班”，线程归还池子
+                    self._busy = False
+                    return
+                job = self._q.popleft()
+            try:
+                self._work(job)          # 计算全程不持锁（可耗时）
+            except Exception as e:
+                # 防御：单帧任务异常不允许卡死本阶段（否则 _busy 恒 True，流水线停摆）。
+                # work 函数内部已各自捕获，这里兜底并继续处理后续排队任务。
+                print(f"_SingleFlightStage 任务异常: {e}")
+
+
+class _OrderedStage:
+    """阶段原语②：单飞 + 按帧号门控（供 P 使用）。
+
+    P 含跨帧状态（previous_frame_objects / past_dis…），必须严格按 seq 串行更新；
+    而 S 失败帧与正常 join 帧可能乱序到达 P，因此不能只靠 FIFO 到达序，
+    需按 expected 帧号门控：乱序到达的任务先进 ready 缓冲，轮到才执行。
+    """
+
+    def __init__(self, pool: ThreadPoolExecutor, work):
+        self._pool = pool
+        self._work = work
+        self._ready = {}            # seq -> job（乱序缓冲）
+        self._expected = 0          # 下一个应执行帧号
+        self._busy = False
+        self._lock = threading.Lock()
+
+    def put(self, job):
+        with self._lock:
+            self._ready[job.seq] = job
+            self._kick()
+
+    def _kick(self):
+        if self._busy or self._expected not in self._ready:
+            return
+        self._busy = True
+        job = self._ready.pop(self._expected)
+        self._expected += 1
+        self._pool.submit(self._run, job)
+
+    def _run(self, job):
+        try:
+            self._work(job)
+        except Exception as e:
+            # 防御：记录异常（否则被线程池的 Future 吞掉后不可见）；
+            # finally 仍会复位 _busy 并推进下一帧，阶段不会停摆。
+            print(f"_OrderedStage 任务异常: {e}")
+        finally:
+            with self._lock:
+                self._busy = False
+                self._kick()             # 跑完这一号，立刻推进下一号
+
+
+class _FrameJob:
+    """一帧在流水线中流转的工单：存 S→L∥V→P 的中间产物与 join 计数。"""
+
+    __slots__ = ("seq", "raw", "on_done", "masked", "overlay",
+                 "masks", "masks_np", "lane", "veh", "failed",
+                 "joined", "lock")
+
+    def __init__(self, seq: int, frame: np.ndarray, on_done):
+        self.seq = seq
+        self.raw = frame               # 原帧（S 阶段 resize 后回写）
+        self.on_done = on_done         # 完成回调（释放背压坑位）
+        self.masked = self.overlay = None
+        self.masks = self.masks_np = None   # masks_tensor(GPU→V) / masks_np(CPU→P)
+        self.lane = self.veh = None
+        self.failed = False            # S 失败标记（跳过 L/V，直接按异常帧产出）
+        self.joined = 0                # L/V join 计数
+        self.lock = threading.Lock()
+
+
+class TrafficAnalyzerLite(TrafficAnalyzer):
+    """线程池精简版：复用父类全部节点/后处理逻辑，只换“编排层”。
+
+    用法：
+        a = TrafficAnalyzerLite(config)
+        # ① 单帧（帧内 DAG）
+        res = a.process_frame(img)
+        # ② 整段视频/帧流（帧间流水线，内部 3 卡 + CPU 并行，阻塞返回按序结果）
+        results = a.process_frames(iter_of_frames)
+        a.shutdown()
+    """
+
+    POOL_WORKERS = 8        # 同时最多 S/L/V/P 各 1 条在忙（=4），留余量
+    DEFAULT_WINDOW = 8      # 在途帧上限（背压窗口）≈ 流水线可重叠帧数
+
+    def __init__(self, config: Optional[DetectionConfig] = None):
+        # 复用父类 __init__：加载模型/标定/跨帧状态缓存；
+        # 但父类末尾会调 _start_workers()，这里被子类重写为空 → 不启动常驻线程/队列会话。
+        super().__init__(config)
+        self._pool = ThreadPoolExecutor(max_workers=self.POOL_WORKERS)
+        # 入口互斥锁：process_frame / process_frames 共用同一批模型对象与跨帧状态，
+        # 二者必须互斥执行（跨线程并发会自动阻塞等待），保证模型“永不并发调用”。
+        self._entry_lock = threading.RLock()
+
+    # ------------------------------------------------------------------
+    # 生命周期钩子
+    # ------------------------------------------------------------------
+    def _start_workers(self):
+        """精简版不启动父类的常驻流水线线程（父类 __init__ 会调用此钩子）。"""
+        pass
+
+    def shutdown(self):
+        """进程退出：关闭线程池（本类没有任何常驻线程/写图线程）。"""
+        self._pool.shutdown(wait=True)
+
+    def _save_abnormal_event(self, frame: np.ndarray) -> str:
+        """精简版：异常事件帧直接同步写盘（父类走异步写图队列，本类没有写图线程）。"""
+        self.count += 1
+        filename = f"{self.count:05d}.jpg"
+        path = os.path.join(self.output_dir, filename)
+        try:
+            cv2.imwrite(path, frame)
+        except Exception as e:
+            print(f"图片写入失败 {path}: {e}")
+        return filename
+
+    def _reset_cross_frame_state(self):
+        """复位跨帧追踪/速度缓存（等价父类 reset_video_state 的核心部分）。
+        每段视频 / 每次单帧调用前自动执行，换视频无需手动复位。"""
+        self.past_dis.clear()
+        self.previous_frame_objects = {}
+        self.previous_frame_lines = {}
+        self.past_drone_speed = 10.0
+        self.past_scaling_factor = 3.0
+        self.scaling_factor = 3.0
+
+    # ------------------------------------------------------------------
+    # 入口①：单帧（帧内 DAG：S → L∥V → P）——复用父类，仅先复位跨帧状态
+    # ------------------------------------------------------------------
+    def process_frame(self, frame: np.ndarray) -> ProcessFrameResult:
+        """处理单张图像（视为独立场景，帧内 DAG 并发：L、V 各占一张 GPU）。"""
+        with self._entry_lock:                 # 与 process_frames 互斥（共享模型，不并发）
+            self._reset_cross_frame_state()
+            return super().process_frame(frame)
+
+    # ------------------------------------------------------------------
+    # 入口②：整段视频/帧流（帧间流水线）—— start/submit/get/close 全被此调用吸收
+    # ------------------------------------------------------------------
+    def process_frames(self, frames, window: Optional[int] = None,
+                       on_result=None, reset_state: bool = True) -> List[ProcessFrameResult]:
+        """按帧序处理整个视频/帧迭代器，阻塞返回按帧序的 List[ProcessFrameResult]。
+
+        内部把 S/L/V/P 排成阶梯流水线（每阶段单飞保序）：
+            S(n+2) 与 L(n+1)/V(n+1) 与 P(n) 三路并行，跨帧状态只在 P 内按帧序更新；
+        有界在途窗口提供背压：frames 是惰性生成器时也最多比处理进度领先 window 帧。
+
+        Args:
+            frames: 帧迭代器（BGR numpy，尺寸不限）；遇 None 视为输入结束。
+            window: 在途帧上限，默认 DEFAULT_WINDOW。
+            on_result: 可选回调 on_result(seq, result)。每帧结果产出的瞬间由 P 阶段
+                调用（线程池线程内，勿做重活），用于外部测量逐帧完成时刻 / 流式推送；
+                默认 None。
+            reset_state: 是否在本次调用开头复位跨帧追踪/速度状态。默认 True：
+                一段新视频 = 一次干净会话。传 False 表示接续上一次调用的状态
+                （模拟同一段连续视频分两次喂入，状态连续流动）。
+
+        线程安全：process_frame 与本方法共用同一批模型对象与跨帧状态，由
+        _entry_lock 互斥（跨线程并发调用会阻塞等待），保证模型“永不并发调用”。
+        注意：on_result 在 P 阶段线程内触发，回调里不要再调 process_frames /
+        process_frame（会与持有 _entry_lock 的主线程互相等待而死锁）。
+        """
+        with self._entry_lock:                   # 生命周期守卫：与 process_frame 互斥
+            return self._process_frames_impl(frames, window, on_result, reset_state)
+
+    def _process_frames_impl(self, frames, window: Optional[int] = None,
+                             on_result=None, reset_state: bool = True) -> List[ProcessFrameResult]:
+        """process_frames 的加锁主体：真正的流水线编排（仅由上面的入口调用）。"""
+        if window is None:
+            window = self.DEFAULT_WINDOW
+        elif not isinstance(window, int) or window < 1:
+            # window=0/负数会让 BoundedSemaphore 永久阻塞 → 显式报错，不做静默兜底
+            raise ValueError(f"window 必须为 >=1 的整数，实际为 {window!r}")
+        if reset_state:
+            self._reset_cross_frame_state()      # 一段新视频 = 一次会话
+
+        # 结果容器：显式按 seq 装配。P 虽为“单飞 + 帧号门控”（天然按序、仅 P 线程写），
+        # 这里仍用 dict 收集 + 末尾按序展开，从结构上不依赖 P 的执行顺序，
+        # 将来即使 P 改为并行执行，返回序与线程安全也不受影响。
+        results_by_seq: Dict[int, ProcessFrameResult] = {}
+
+        # ---- 4 个节点的 work（DAG 拓扑集中在这里：S → fork(L,V) → join → P）----
+        def work_S(job: _FrameJob):
+            frame = job.raw
+            try:
+                if frame.shape[0] != self.input_height or frame.shape[1] != self.input_width:
+                    frame = cv2.resize(frame, (self.input_width, self.input_height))
+                masked, overlay, masks_tensor, masks_np = self._segment_road(frame)
+            except Exception as e:
+                print(f"Lite S 节点错误 seq={job.seq}: {e}")
+                masked = overlay = masks_tensor = masks_np = None
+
+            if masks_np is None:
+                # 分割失败/未检出道路：跳过 L/V，直接作为异常包进 P（P 按帧号门控，保输出有序）
+                job.failed = True
+                job.raw = frame
+                p.put(job)
+            else:
+                job.raw = frame                 # resize 后的原帧（异常兜底/画面上用）
+                job.masked, job.overlay = masked, overlay
+                job.masks, job.masks_np = masks_tensor, masks_np
+                l.put(job)                      # fork：同一工单进入 L、V 两条支路
+                v.put(job)
+
+        def work_L(job: _FrameJob):
+            try:
+                lane = self._node_lane(job.masked)
+            except Exception as e:
+                print(f"Lite L 节点错误 seq={job.seq}: {e}")
+                lane = None                     # 置空交给 P 的空检守卫按异常帧处理
+            with job.lock:
+                job.lane = lane
+                job.joined += 1
+                if job.joined == 2:
+                    p.put(job)                  # join：L、V 都完成才放行 P（锁保证只放行一次）
+
+        def work_V(job: _FrameJob):
+            try:
+                veh = self._node_vehicle(job.masked, job.masks)
+            except Exception as e:
+                print(f"Lite V 节点错误 seq={job.seq}: {e}")
+                veh = None
+            with job.lock:
+                job.veh = veh
+                job.joined += 1
+                if job.joined == 2:
+                    p.put(job)
+
+        def work_P(job: _FrameJob):
+            # 本函数保证不抛异常：任何失败路径都产出 is_abnormal=True 的结果并释放坑位
+            if job.failed or job.raw is None:
+                res = ProcessFrameResult(
+                    frame=(job.raw.copy() if job.raw is not None else np.zeros(
+                        (self.input_height, self.input_width, 3), dtype=np.uint8)),
+                    is_abnormal=True)
+            else:
+                try:
+                    res = self._run_post_stage(
+                        job.lane, job.veh, job.overlay, job.masks_np)
+                except Exception as e:
+                    print(f"Lite P 节点错误 seq={job.seq}: {e}")
+                    res = ProcessFrameResult(frame=job.raw.copy(), is_abnormal=True)
+            # 记录结果 + 触发回调。try/finally 保证 on_done 必然执行：
+            # 若回调抛异常而不释放槽位，主线程 drain 阶段会永久阻塞（死锁）。
+            try:
+                results_by_seq[job.seq] = res     # 先落结果，回调失败也不丢帧
+                if on_result is not None:
+                    on_result(job.seq, res)
+            except Exception as e:
+                print(f"Lite P 阶段 on_result 回调错误 seq={job.seq}: {e}")
+            finally:
+                job.on_done()                     # 兜底：任何路径都释放背压坑位
+
+        # ---- 装配阶段（同一线程池，空闲阶段不占线程）----
+        s = _SingleFlightStage(self._pool, work_S)   # 分割 cuda:0（单飞保序）
+        l = _SingleFlightStage(self._pool, work_L)   # 车道 cuda:2
+        v = _SingleFlightStage(self._pool, work_V)   # 车辆 cuda:1
+        p = _OrderedStage(self._pool, work_P)        # 后处理 CPU（按帧号门控）
+
+        # ---- 投帧（有界背压：最多 window 帧在途，不丢帧、不无界堆积）----
+        slot = threading.BoundedSemaphore(window)
+        seq = 0
+        for frame in frames:
+            if frame is None:
+                break
+            slot.acquire()                        # 坑满则阻塞：源生成器不会跑太快
+            s.put(_FrameJob(seq, frame, slot.release))
+            seq += 1
+
+        # 等全部处理完：把 window 个名额重新取回 == 每个在途任务都已释放。
+        # work_P 已保证 on_done 必然执行，故这里的 acquire 不会永久阻塞。
+        for _ in range(window):
+            slot.acquire()
+
+        # 不变式校验 + 按 seq 展开为有序列表：每个任务都“先记结果、后放槽位”，
+        # keys 必然恰好覆盖 0..seq-1；此校验用于尽早暴露未来的回归。
+        if len(results_by_seq) != seq:
+            missing = [i for i in range(seq) if i not in results_by_seq]
+            raise RuntimeError(f"流水线结果缺失（{len(missing)} 帧）: {missing}")
+        return [results_by_seq[i] for i in range(seq)]
+
 
