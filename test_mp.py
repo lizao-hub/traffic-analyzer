@@ -10,8 +10,7 @@ import os
 
 import cv2
 
-from process_mp import TrafficAnalyzerMP
-from process import DetectionConfig
+from process_mp import TrafficAnalyzerMP, DetectionConfig
 
 
 def main():
